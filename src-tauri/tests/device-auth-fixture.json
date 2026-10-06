@@ -1,0 +1,12 @@
+{
+  "deviceId": "fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889",
+  "publicKey": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+  "scopes": [
+    "operator.read",
+    "operator.write",
+    "operator.admin",
+    "operator.approvals"
+  ],
+  "payload": "v3|fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889|openclaw-macos|ui|operator|operator.read,operator.write,operator.admin,operator.approvals|1737264000000|shared-token|nonce-123|macos|mac",
+  "signature": "jLe3gfwJJKxTL_hEp5FyKlhHDaSUINt6vOkN8C5-T9XcQJMTACqkCKF9oDO0qfnzla69I86ypgIVGlK-71CfCg"
+}

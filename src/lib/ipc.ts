@@ -1,0 +1,112 @@
+// Bridge to the Rust core. Every gateway call goes through `gw_call`; events
+// arrive as Tauri events. Outside Tauri (plain `pnpm dev` in a browser) a mock
+// backend with fixture data is used so the UI can be iterated on directly.
+import type {
+  AcpConfig,
+  ConnStatus,
+  DiscoveredGateway,
+  DoctorReport,
+  GatewayEntry,
+  HermesConfig,
+  HermesProbe,
+  Navigate,
+  RegistryAgent,
+  Roster,
+} from "./types";
+
+export interface RpcError {
+  code: string;
+  message: string;
+  details?: unknown;
+}
+
+type Unlisten = () => void;
+
+export interface Backend {
+  invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T>;
+  listen<T>(event: string, cb: (payload: T) => void): Promise<Unlisten>;
+}
+
+const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+let backendPromise: Promise<Backend> | null = null;
+function backend(): Promise<Backend> {
+  backendPromise ??= inTauri
+    ? Promise.all([import("@tauri-apps/api/core"), import("@tauri-apps/api/event")]).then(([core, event]) => ({
+        invoke: <T,>(cmd: string, args?: Record<string, unknown>) => core.invoke<T>(cmd, args),
+        listen: <T,>(name: string, cb: (payload: T) => void) => event.listen<T>(name, (e) => cb(e.payload)),
+      }))
+    : import("./mock").then((m) => m.mockBackend);
+  return backendPromise;
+}
+
+export const isTauri = inTauri;
+
+export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  return (await backend()).invoke<T>(cmd, args);
+}
+
+export async function listen<T>(event: string, cb: (payload: T) => void): Promise<Unlisten> {
+  return (await backend()).listen<T>(event, cb);
+}
+
+/** Generic gateway RPC against one gateway. Rejects with an RpcError. */
+export function gwCall<T = unknown>(gateway: string, method: string, params: object = {}, timeoutMs?: number): Promise<T> {
+  return invoke<T>("gw_call", { gateway, method, params, timeoutMs });
+}
+
+export function errorMessage(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object" && "message" in err) return String((err as { message: unknown }).message);
+  return "Something went wrong";
+}
+
+export const core = {
+  statuses: () => invoke<ConnStatus[]>("gw_statuses"),
+  reconnect: (gateway?: string) => invoke<void>("gw_reconnect", { gateway: gateway ?? null }),
+  setCredential: (gateway: string, kind: "token" | "password", value: string | null) =>
+    invoke<void>("gw_set_credential", { gateway, kind, value }),
+  roster: () => invoke<Roster>("get_roster"),
+  refreshRoster: (gateway?: string) => invoke<Roster>("refresh_roster", { gateway: gateway ?? null }),
+  setGuyHidden: (uid: string, hidden: boolean) => invoke<void>("set_guy_hidden", { uid, hidden }),
+  setFocusedSession: (gateway: string | null, key: string | null) =>
+    invoke<void>("set_focused_session", { gateway, key }),
+  openMain: (nav?: Navigate) =>
+    invoke<void>("open_main", {
+      gateway: nav?.gatewayId ?? null,
+      agentId: nav?.agentId ?? null,
+      sessionKey: nav?.sessionKey ?? null,
+      view: nav?.view ?? null,
+    }),
+  gateways: {
+    add: (url: string, name?: string, kind?: "token" | "password", secret?: string) =>
+      invoke<GatewayEntry>("gateway_add", { url, name: name ?? null, kind: kind ?? null, secret: secret ?? null }),
+    update: (id: string, patch: { name?: string; enabled?: boolean }) =>
+      invoke<void>("gateway_update", { id, name: patch.name ?? null, enabled: patch.enabled ?? null }),
+    remove: (id: string) => invoke<void>("gateway_remove", { id }),
+    discover: () => invoke<DiscoveredGateway[]>("gateways_discover"),
+    /** Connect with an OpenClaw setup code; resolves to the gateway id. */
+    useSetupCode: (code: string) => invoke<string>("gateway_setup_code", { code }),
+  },
+  bots: {
+    addAcp: (acp: AcpConfig, name?: string, secret?: string) =>
+      invoke<GatewayEntry>("bot_add", { kind: "acp", name: name ?? null, acp, hermes: null, secretKind: secret ? "token" : null, secret: secret ?? null }),
+    addHermes: (hermes: HermesConfig, name?: string, apiKey?: string) =>
+      invoke<GatewayEntry>("bot_add", { kind: "hermes", name: name ?? null, acp: null, hermes, secretKind: apiKey ? "token" : null, secret: apiKey ?? null }),
+    acpRegistry: () => invoke<RegistryAgent[]>("acp_registry"),
+    hermesDetect: () => invoke<HermesProbe[]>("hermes_detect"),
+  },
+  hidePopover: () => invoke<void>("hide_popover"),
+  fitPopover: (height: number) => invoke<void>("fit_popover", { height }),
+  revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  quit: () => invoke<void>("quit"),
+  doctor: {
+    check: () => invoke<DoctorReport>("doctor_check"),
+    install: (version?: string) => invoke<void>("doctor_install_openclaw", { version: version ?? null }),
+    update: () => invoke<void>("doctor_update_openclaw"),
+    startGateway: () => invoke<void>("doctor_start_gateway"),
+    onboard: (authChoice: string, apiKey: string | null, agentName: string | null) =>
+      invoke<void>("doctor_onboard", { authChoice, apiKey, agentName }),
+    gatewayLog: (lines = 80) => invoke<string | null>("doctor_gateway_log", { lines }),
+  },
+};
