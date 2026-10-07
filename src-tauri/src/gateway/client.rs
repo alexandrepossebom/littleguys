@@ -246,6 +246,13 @@ impl GatewayClient {
         &self.inner.paths
     }
 
+    /// The device token for the current address, for the gateway's HTTP
+    /// endpoints (`Authorization: Bearer …`).
+    pub fn http_bearer(&self) -> Option<String> {
+        let url = self.inner.status.lock().unwrap().url.clone()?;
+        self.inner.tokens.load(&url, ROLE).map(|t| t.token)
+    }
+
     /// Drop the current connection (if any) and reconnect immediately,
     /// re-reading the OpenClaw config.
     pub fn reconnect_now(&self) {
@@ -641,6 +648,7 @@ async fn connect_and_serve(inner: &Arc<Inner>, endpoint: &Endpoint, credential: 
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
+        s.capabilities = crate::runtime::Capabilities::openclaw_from_hello(&hello, &s.scopes);
         s.hello = Some(hello.clone());
     });
     (inner.hooks.connected)();

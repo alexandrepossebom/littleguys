@@ -1,4 +1,4 @@
-import { Archive, ChevronRight, FolderOpen, MoreHorizontal, Pencil, Pin, PinOff, SquarePen, Trash2 } from "lucide-react";
+import { AlarmClock, Archive, ChevronRight, Folder, MessageCircle, MoreHorizontal, Pencil, Pin, PinOff, Sparkles, SquarePen, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { sessions as sessionsApi } from "../lib/gateway";
 import {
@@ -9,7 +9,6 @@ import {
   gatewayOf,
   guyName,
   isMultiGateway,
-  isOnThisMac,
   isRunning,
   RUNTIME_LABEL,
   sessionsFor,
@@ -17,11 +16,13 @@ import {
   threadKind,
   threadTitle,
 } from "../lib/guys";
-import { core, errorMessage } from "../lib/ipc";
+import { core } from "../lib/ipc";
 import type { Guy, SessionRow } from "../lib/types";
-import { mainSessionKey, useApp, useSelectedGuy } from "../stores/app";
+import { type MainView, mainSessionKey, useApp, useSelectedGuy } from "../stores/app";
 import { Avatar } from "../ui/Avatar";
-import { IconButton, inputClass, Segmented, TypingDots } from "../ui/kit";
+import { IconButton, inputClass, TypingDots } from "../ui/kit";
+import { FileTree } from "./Files";
+import { AbilityList } from "./Skills";
 
 export function Sidebar() {
   const guy = useSelectedGuy();
@@ -29,22 +30,50 @@ export function Sidebar() {
   const setView = useApp((s) => s.setView);
   const caps = useApp((s) => capsOf(s.roster, guy?.gatewayId));
   if (!guy) return <aside className="w-[264px] shrink-0" />;
+  const tabs: Array<{ value: MainView; label: string; icon: React.ReactNode }> = [
+    { value: "chat", label: "Chats", icon: <MessageCircle size={14} /> },
+    ...(caps.routines ? [{ value: "routines" as const, label: "Routines", icon: <AlarmClock size={14} /> }] : []),
+    ...(caps.files ? [{ value: "files" as const, label: "Files", icon: <Folder size={14} /> }] : []),
+    ...(caps.skills || caps.tools || caps.plugins ? [{ value: "skills" as const, label: "Skills", icon: <Sparkles size={14} /> }] : []),
+  ];
+  // A tab the guy's runtime doesn't have falls back to its chats.
+  const current = tabs.some((t) => t.value === view) ? view : "chat";
   return (
     <aside className="flex w-[264px] shrink-0 flex-col">
       <GuyHeader guy={guy} />
-      {caps.routines && (
-        <div className="px-3 pb-2">
-          <Segmented
-            value={view}
-            onChange={setView}
-            options={[
-              { value: "chat", label: "Chats" },
-              { value: "routines", label: "Routines" },
-            ]}
-          />
+      {tabs.length > 1 && (
+        <div className="flex gap-1 px-3 pb-2.5" role="tablist">
+          {tabs.map((t) => {
+            const active = current === t.value;
+            return (
+              <button
+                key={t.value}
+                role="tab"
+                aria-selected={active}
+                title={t.label}
+                onClick={() => setView(t.value)}
+                className={`flex h-8 items-center justify-center gap-1.5 rounded-full text-[12.5px] font-medium transition-[flex-grow,background-color,color] duration-200 ${
+                  active
+                    ? "flex-[2.2] bg-[var(--color-ink)] px-3 text-[var(--color-pane-solid)]"
+                    : "flex-1 text-[var(--color-ink-2)] hover:bg-[var(--color-chip)] hover:text-[var(--color-ink)]"
+                }`}
+              >
+                {t.icon}
+                {active && <span className="truncate">{t.label}</span>}
+              </button>
+            );
+          })}
         </div>
       )}
-      <ThreadList guy={guy} />
+      {current === "files" ? (
+        <FileTree key={guy.uid} guy={guy} />
+      ) : current === "skills" ? (
+        <AbilityList key={guy.uid} guy={guy} />
+      ) : current === "routines" ? (
+        <RoutineRunList guy={guy} />
+      ) : (
+        <ThreadList guy={guy} />
+      )}
     </aside>
   );
 }
@@ -53,9 +82,7 @@ function GuyHeader({ guy }: { guy: Guy }) {
   const roster = useApp((s) => s.roster);
   const openEditor = useApp((s) => s.openEditor);
   const act = activityFor(roster, guy);
-  const [revealError, setRevealError] = useState<string | null>(null);
   const gateway = gatewayOf(roster, guy.gatewayId);
-  const local = isOnThisMac(gateway);
   const caps = capsOf(roster, guy.gatewayId);
   const runtime = gateway?.status.kind && gateway.status.kind !== "openclaw" ? RUNTIME_LABEL[gateway.status.kind] : null;
   const multi = isMultiGateway(roster);
@@ -84,33 +111,8 @@ function GuyHeader({ guy }: { guy: Guy }) {
           <p className="truncate text-[11.5px] text-[var(--color-ink-3)]">{subtitle}</p>
         </div>
       </div>
-      {guy.workspace && (
-        <button
-          onClick={() => {
-            if (!local) {
-              navigator.clipboard.writeText(guy.workspace!);
-              setRevealError(`Path copied — the workspace lives on ${guy.gatewayName}.`);
-              setTimeout(() => setRevealError(null), 2500);
-              return;
-            }
-            core.revealPath(guy.workspace!).catch((e) => {
-              setRevealError(errorMessage(e));
-              setTimeout(() => setRevealError(null), 3000);
-            });
-          }}
-          title={local ? `Open ${guy.workspace} in Finder` : `${guy.workspace} (on ${guy.gatewayName}) — click to copy`}
-          className="mt-2 flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-[11.5px] text-[var(--color-ink-2)] transition hover:bg-[var(--color-chip)]"
-        >
-          <FolderOpen size={13} className="shrink-0 opacity-70" />
-          <span className="truncate">{revealError ?? prettyPath(guy.workspace)}</span>
-        </button>
-      )}
     </div>
   );
-}
-
-function prettyPath(p: string): string {
-  return p.replace(/^\/Users\/[^/]+/, "~").replace(/^\/home\/[^/]+/, "~");
 }
 
 type Group = { id: string; title: string; rows: SessionRow[]; collapsible: boolean };
@@ -131,12 +133,8 @@ function ThreadList({ guy }: { guy: Guy }) {
     const main = rows.find((r) => threadKind(r.key) === "main");
     // Channel conversations sit alongside app chats; ThreadRow badges them with their channel.
     const threads = rows.filter((r) => ["chat", "channel"].includes(threadKind(r.key))).sort(byActivity);
-    const routines = rows.filter((r) => threadKind(r.key) === "routine").sort(byActivity);
     const mainRow: SessionRow = main ?? ({ key: mainSessionKey(guy.id), kind: "direct", updatedAt: null } as SessionRow);
-    return [
-      { id: "threads", title: "", rows: [mainRow, ...threads], collapsible: false },
-      { id: "routine", title: "Routine runs", rows: routines, collapsible: true },
-    ].filter((g) => g.rows.length > 0);
+    return [{ id: "threads", title: "", rows: [mainRow, ...threads], collapsible: false }];
   }, [roster, guy]);
 
   const newThread = useCallback(async () => {
@@ -159,8 +157,8 @@ function ThreadList({ guy }: { guy: Guy }) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-center justify-between px-4 pb-1">
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--color-ink-3)]">Threads</span>
+      <div className="flex items-center justify-between pb-1 pl-4 pr-2.5">
+        <h3 className="font-display text-[13px] font-semibold">Threads</h3>
         {caps.newThreads && (
           <IconButton label="New thread (⌘N)" onClick={newThread} disabled={creating}>
             <SquarePen size={14} />
@@ -195,6 +193,59 @@ function ThreadList({ guy }: { guy: Guy }) {
               ))}
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+/** The Routines tab's sidebar: the routines themselves, then each run's conversation. */
+function RoutineRunList({ guy }: { guy: Guy }) {
+  const roster = useApp((s) => s.roster);
+  const caps = capsOf(roster, guy.gatewayId);
+  const run = useApp((s) => s.routineRunByGuy[guy.uid] ?? null);
+  const selectRoutineRun = useApp((s) => s.selectRoutineRun);
+  const runs = useMemo(
+    () =>
+      sessionsFor(roster, guy)
+        .filter((r) => !r.archived && threadKind(r.key) === "routine")
+        .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)),
+    [roster, guy],
+  );
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex items-center pb-1 pl-4 pr-2.5">
+        <h3 className="font-display text-[13px] font-semibold">Routines</h3>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+        <button
+          onClick={() => selectRoutineRun(null)}
+          className={`mb-0.5 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition ${
+            run ? "hover:bg-[var(--color-chip)]" : "bg-[var(--color-accent)] text-white shadow-sm"
+          }`}
+        >
+          <AlarmClock size={14} className="shrink-0 opacity-80" />
+          <span className="font-medium">All routines</span>
+        </button>
+        <p className="flex items-center gap-1.5 px-2 pb-1 pt-3 text-[11.5px] font-medium text-[var(--color-ink-3)]">
+          Recent runs
+          {runs.length > 0 && <span className="rounded-full bg-[var(--color-chip)] px-1.5 text-[10.5px] tabular-nums">{runs.length}</span>}
+        </p>
+        {runs.length === 0 ? (
+          <p className="px-2 py-1 text-[12px] text-[var(--color-ink-3)]">Each time a routine runs, its conversation shows up here.</p>
+        ) : (
+          runs.map((row) => (
+            <ThreadRow
+              key={row.key}
+              actions={caps.threadActions}
+              gatewayId={guy.gatewayId}
+              agentId={guy.id}
+              row={row}
+              running={isRunning(roster, guy.gatewayId, row.key)}
+              selected={run === row.key}
+              onSelect={() => selectRoutineRun(row.key)}
+            />
+          ))
+        )}
       </div>
     </div>
   );
@@ -350,6 +401,11 @@ function ThreadMenu({
     await fn().catch(() => {});
     core.refreshRoster(gatewayId).catch(() => {});
   };
+  const leaveIfOpen = () => {
+    const s = useApp.getState();
+    if (s.selectedUid && s.routineRunByGuy[s.selectedUid] === row.key) s.selectRoutineRun(null);
+    else if (selected === row.key) selectSession(mainSessionKey(agentId));
+  };
   const kind = threadKind(row.key);
 
   return (
@@ -370,7 +426,7 @@ function ThreadMenu({
         onClick={() =>
           act(async () => {
             await sessionsApi.patch(gatewayId, row.key, { archived: true }, row.sessionId ?? undefined);
-            if (selected === row.key) selectSession(mainSessionKey(agentId));
+            leaveIfOpen();
           })
         }
       />
@@ -383,7 +439,7 @@ function ThreadMenu({
             act(async () => {
               await sessionsApi.patch(gatewayId, row.key, { archived: true }, row.sessionId ?? undefined);
               await sessionsApi.remove(gatewayId, row.key);
-              if (selected === row.key) selectSession(mainSessionKey(agentId));
+              leaveIfOpen();
             })
           }
         />

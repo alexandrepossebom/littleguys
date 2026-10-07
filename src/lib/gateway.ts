@@ -1,7 +1,21 @@
 // Typed wrappers for the gateway methods littleguys uses. Every call names the
 // gateway it goes to (`gw` = gateway id).
 import { gwCall } from "./ipc";
-import type { AgentSummary, Attachment, ChatMessage, CronJob, CronRunLogEntry, ModelChoice, SessionRow } from "./types";
+import type {
+  AgentSummary,
+  Attachment,
+  ChatMessage,
+  CronJob,
+  CronRunLogEntry,
+  McpServer,
+  ModelChoice,
+  PluginEntry,
+  SessionRow,
+  SkillEntry,
+  ToolGroup,
+  WorkspaceFile,
+  WorkspaceListing,
+} from "./types";
 
 export function newIdempotencyKey(): string {
   return crypto.randomUUID();
@@ -133,4 +147,58 @@ export const config = {
 export const approvals = {
   resolve: (gw: string, id: string, decision: "allow-once" | "allow-always" | "deny") =>
     gwCall(gw, "exec.approval.resolve", { id, decision }),
+};
+
+/** Read-only view of a guy's workspace folder. */
+export const workspace = {
+  list: (gw: string, agentId: string, path = "", offset = 0) =>
+    gwCall<WorkspaceListing>(gw, "agents.workspace.list", { agentId, ...(path ? { path } : {}), offset, limit: 250 }),
+  get: (gw: string, agentId: string, path: string) =>
+    gwCall<{ agentId: string; file: WorkspaceFile }>(gw, "agents.workspace.get", { agentId, path }, 30_000),
+};
+
+export const skills = {
+  status: (gw: string, agentId: string) =>
+    gwCall<{ skills: SkillEntry[]; workspaceDir?: string }>(gw, "skills.status", { agentId }, 30_000),
+  /** SKILL.md of a skill (Hermes and ACP; OpenClaw reads it from the workspace). */
+  read: (gw: string, agentId: string, name: string) =>
+    gwCall<{ name: string; path?: string; content: string }>(gw, "skills.read", { agentId, name }),
+};
+
+export const tools = {
+  /** What the guy can actually use in this session. */
+  effective: (gw: string, agentId: string, sessionKey: string) =>
+    gwCall<{ groups: ToolGroup[]; profile?: string }>(gw, "tools.effective", { agentId, sessionKey }, 30_000),
+  catalog: (gw: string, agentId: string) =>
+    gwCall<{ groups: ToolGroup[] }>(gw, "tools.catalog", { agentId, includePlugins: true }, 30_000),
+};
+
+export const plugins = {
+  list: (gw: string) => gwCall<{ plugins: PluginEntry[] }>(gw, "plugins.list"),
+};
+
+export const mcp = {
+  /** Hermes and ACP; OpenClaw keeps MCP servers in config (see abilities.ts). */
+  servers: (gw: string, agentId: string) => gwCall<{ servers: McpServer[] }>(gw, "mcp.servers.list", { agentId }),
+};
+
+/** OpenClaw's browser control API, proxied through the gateway (needs admin). */
+export const browser = {
+  request: <T = unknown>(
+    gw: string,
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    opts: { profile?: string; body?: object; query?: Record<string, string> } = {},
+  ) =>
+    gwCall<T>(
+      gw,
+      "browser.request",
+      {
+        method,
+        path,
+        query: { ...opts.query, ...(opts.profile ? { profile: opts.profile } : {}) },
+        ...(opts.body ? { body: opts.body } : {}),
+      },
+      30_000,
+    ),
 };

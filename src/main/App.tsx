@@ -3,13 +3,16 @@ import { capsOf, liveGateways } from "../lib/guys";
 import { core, listen } from "../lib/ipc";
 import { useApp, useSelectedGuy } from "../stores/app";
 import { AddGateway } from "./AddGateway";
+import { BrowserPanel } from "./BrowserPanel";
 import { ChatView } from "./ChatView";
 import { Doctor } from "./Doctor";
+import { FilesView } from "./Files";
 import { GatewayBanner } from "./GatewayBanner";
 import { GuyEditor } from "./GuyEditor";
 import { RoutinesPanel } from "./Routines";
 import { Settings } from "./Settings";
 import { Sidebar } from "./Sidebar";
+import { SkillsView } from "./Skills";
 import { StoriesBar } from "./StoriesBar";
 
 export function App() {
@@ -20,17 +23,18 @@ export function App() {
   const settingsOpen = useApp((s) => s.settingsOpen);
   const addGatewayOpen = useApp((s) => s.addGatewayOpen);
   const guy = useSelectedGuy();
+  const browserOpen = useApp((s) => (guy ? Boolean(s.browser.open[guy.uid]) : false));
+  const routineRun = useApp((s) => (guy ? (s.routineRunByGuy[guy.uid] ?? null) : null));
   const connected = liveGateways(roster).length > 0;
   const caps = capsOf(roster, guy?.gatewayId);
   const gatewayId = guy?.gatewayId ?? null;
 
   // Tell the core which thread is on screen (so it doesn't notify for it).
+  const onScreen = view === "chat" ? selectedSessionKey : view === "routines" ? routineRun : null;
   useEffect(() => {
     let focused = document.hasFocus();
     const sync = () =>
-      core
-        .setFocusedSession(focused && view === "chat" ? gatewayId : null, focused && view === "chat" ? selectedSessionKey : null)
-        .catch(() => {});
+      core.setFocusedSession(focused && onScreen ? gatewayId : null, focused ? onScreen : null).catch(() => {});
     sync();
     const unlisten = listen<boolean>("lg:main-focus", (f) => {
       focused = f;
@@ -39,7 +43,7 @@ export function App() {
     return () => {
       unlisten.then((u) => u());
     };
-  }, [gatewayId, selectedSessionKey, view]);
+  }, [gatewayId, onScreen]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -71,9 +75,22 @@ export function App() {
             <main className="flex min-w-0 flex-1 flex-col border-l border-[var(--color-line)] bg-[var(--color-pane-solid)]">
               {guy &&
                 (view === "routines" && caps.routines ? (
-                  <RoutinesPanel key={guy.uid} guy={guy} />
+                  routineRun ? (
+                    <ChatView key={`${guy.gatewayId}|${routineRun}`} guy={guy} sessionKey={routineRun} />
+                  ) : (
+                    <RoutinesPanel key={guy.uid} guy={guy} />
+                  )
+                ) : view === "files" && caps.files ? (
+                  <FilesView key={guy.uid} guy={guy} />
+                ) : view === "skills" && (caps.skills || caps.tools || caps.plugins) ? (
+                  <SkillsView key={guy.uid} guy={guy} />
                 ) : selectedSessionKey ? (
-                  <ChatView key={`${guy.gatewayId}|${selectedSessionKey}`} guy={guy} sessionKey={selectedSessionKey} />
+                  <div className="flex h-full min-h-0">
+                    <div className="flex min-w-0 flex-1 flex-col">
+                      <ChatView key={`${guy.gatewayId}|${selectedSessionKey}`} guy={guy} sessionKey={selectedSessionKey} />
+                    </div>
+                    {caps.browser && browserOpen && <BrowserPanel key={guy.uid} guy={guy} />}
+                  </div>
                 ) : null)}
             </main>
           </>

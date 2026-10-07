@@ -32,7 +32,7 @@ function status(id: string, name: string, url: string, phase: ConnStatus["phase"
     credentialIssue: null,
     hello: { policy: { attachments: { maxBytes: 20 << 20, maxImageBytes: 6 << 20 } } },
     kind: "openclaw",
-    capabilities: { manageGuys: true, routines: true, routinesLocal: false, approvals: true, threadActions: true, newThreads: true, attachments: true, models: true },
+    capabilities: { manageGuys: true, routines: true, routinesLocal: false, approvals: true, threadActions: true, newThreads: true, attachments: true, models: true, files: true, skills: true, tools: true, plugins: true, browser: true },
     ...extra,
   };
 }
@@ -99,7 +99,7 @@ const hermes = gateway("hermes-1", "Hermes", "http://127.0.0.1:9119", "connected
     { key: "agent:default:telegram:t1", agentId: "default", kind: "direct", displayName: "Telegram · Mom", updatedAt: now - 70 * min, lastMessagePreview: "Reminded her about Sunday lunch." },
   ] as never,
 });
-hermes.status = { ...hermes.status, kind: "hermes", capabilities: { ...hermes.status.capabilities, manageGuys: false, attachments: false, models: false } };
+hermes.status = { ...hermes.status, kind: "hermes", capabilities: { ...hermes.status.capabilities, manageGuys: false, attachments: false, models: false, browser: false } };
 
 const claude = gateway("acp-claude", "Claude Code", "npx -y @agentclientprotocol/claude-agent-acp", "connected", {
   defaultAgentId: "bot",
@@ -110,7 +110,7 @@ claude.status = {
   ...claude.status,
   kind: "acp",
   mode: null,
-  capabilities: { manageGuys: false, routines: true, routinesLocal: true, approvals: true, threadActions: true, newThreads: true, attachments: true, models: false },
+  capabilities: { manageGuys: false, routines: true, routinesLocal: true, approvals: true, threadActions: true, newThreads: true, attachments: true, models: false, files: true, skills: true, tools: false, plugins: true, browser: false },
 };
 
 const roster: Roster = {
@@ -123,6 +123,11 @@ const oc = (id: string, extra: object = {}) => ({ __openclaw: { id, ...extra } }
 
 const history: Record<string, ChatMessage[]> = {
   "openclaw|agent:main:main": [
+    { role: "user", content: "What's the weather looking like this weekend?", timestamp: now - 26 * 60 * min, ...oc("y1") },
+    { role: "assistant", content: [{ type: "toolCall", id: "y2", name: "web_search", arguments: { query: "São Paulo weather weekend" } }, { type: "toolCall", id: "y3", name: "web_fetch", arguments: { url: "https://weather.example/sao-paulo" } }], timestamp: now - 26 * 60 * min + 20_000, ...oc("y2") },
+    { role: "toolResult", toolCallId: "y2", toolName: "web_search", isError: false, content: [{ type: "text", text: "Sunny Sat, showers Sun" }], ...oc("y4") },
+    { role: "toolResult", toolCallId: "y3", toolName: "web_fetch", isError: false, content: [{ type: "text", text: "Sat 27° sunny · Sun 22° rain" }], ...oc("y5") },
+    { role: "assistant", content: [{ type: "text", text: "Saturday looks great: **27° and sunny**. Sunday turns rainy (22°), so plan anything outdoors for Saturday." }], timestamp: now - 26 * 60 * min + 40_000, ...oc("y6") },
     { role: "user", content: "Can you find a nice Italian place near the office for Friday, 8pm, 2 people?", timestamp: now - 12 * min, ...oc("u1") },
     { role: "assistant", content: [{ type: "thinking", thinking: "**Searching restaurants near the office**" }, { type: "toolCall", id: "t1", name: "web_search", arguments: { query: "best italian restaurant near Rua Augusta São Paulo" } }], timestamp: now - 11 * min, ...oc("a1") },
     { role: "toolResult", toolCallId: "t1", toolName: "web_search", isError: false, content: [{ type: "text", text: "1. Trattoria Nonna — 4.7★\n2. Osteria del Ponte — 4.6★\n3. Piccolo — 4.5★" }], ...oc("r1") },
@@ -198,6 +203,134 @@ function streamReply(gateway: string, sessionKey: string, text: string) {
   return { runId, status: "started" };
 }
 
+// ---- workspace / skills / browser fixtures ----
+
+const workspaceTree: Record<string, Array<{ name: string; kind: "file" | "directory"; size?: number }>> = {
+  "": [
+    { name: "memory", kind: "directory" },
+    { name: "skills", kind: "directory" },
+    { name: "AGENTS.md", kind: "file", size: 1840 },
+    { name: "SOUL.md", kind: "file", size: 912 },
+    { name: "USER.md", kind: "file", size: 410 },
+    { name: "notes.ts", kind: "file", size: 388 },
+    { name: "guy.png", kind: "file", size: 5120 },
+  ],
+  memory: [
+    { name: "2026-10-05.md", kind: "file", size: 640 },
+    { name: "2026-10-06.md", kind: "file", size: 512 },
+  ],
+  skills: [{ name: "trip-planner", kind: "directory" }],
+  "skills/trip-planner": [{ name: "SKILL.md", kind: "file", size: 730 }],
+};
+
+const workspaceFiles: Record<string, string> = {
+  "AGENTS.md": "# AGENTS.md\n\nYou are **Jefe**, a helpful little guy.\n\n## Rules\n\n- Be brief.\n- Use the browser for anything that needs a website.\n\n## Browser (from littleguys)\n\nAlways use the browser tool with `profile=\"main\"`.\n",
+  "SOUL.md": "# SOUL.md\n\nCurious, upbeat, a little dramatic about restaurants.\n",
+  "USER.md": "# USER.md\n\n- Lives in São Paulo\n- Prefers window seats\n",
+  "notes.ts": "// scratch\nexport function greet(name: string): string {\n  return `Hi, ${name}!`;\n}\n\nconst places = [\"Trattoria\", \"Mocotó\"]; // TODO: rank\n",
+  "memory/2026-10-05.md": "# 2026-10-05\n\n- Booked Trattoria for Friday.\n",
+  "memory/2026-10-06.md": "# 2026-10-06\n\n- Herval asked about flights to Tokyo.\n",
+  "skills/trip-planner/SKILL.md": "---\nname: trip-planner\ndescription: Plan trips end to end.\n---\n\n# Trip planner\n\n1. Ask dates and budget.\n2. Search flights in the browser.\n3. Summarize the best 3 options.\n",
+};
+
+const GUY_PNG = "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAASUlEQVR4nGP4/+sbVRDDEDKoyhUnIsEgPKbgMAvDIIJG4DCORgaRZAqqWQwUmYJk1qhBowZR2SCqpexBmWmpWR5RuYQkHVHNIACYoS6r4bWGogAAAABJRU5ErkJggg==";
+
+function workspaceList(path: string) {
+  const entries = (workspaceTree[path] ?? []).map((e) => ({
+    ...e,
+    path: path ? `${path}/${e.name}` : e.name,
+    updatedAtMs: now - 3 * 60 * min,
+  }));
+  return { agentId: "main", path, ...(path ? { parentPath: path.split("/").slice(0, -1).join("/") } : {}), entries, totalEntries: entries.length, offset: 0 };
+}
+
+function workspaceGet(path: string) {
+  const name = path.split("/").pop() ?? path;
+  if (name.endsWith(".png")) return { agentId: "main", file: { path, name, size: 5120, updatedAtMs: now, mimeType: "image/png", encoding: "base64", content: GUY_PNG } };
+  const content = workspaceFiles[path];
+  if (content == null) throw { code: "INVALID_REQUEST", message: "workspace file not found" };
+  return { agentId: "main", file: { path, name, size: content.length, updatedAtMs: now - 3 * 60 * min, mimeType: "text/plain", encoding: "utf8", content } };
+}
+
+const mockSkills = [
+  { name: "trip-planner", skillKey: "trip-planner", description: "Plan trips end to end: flights, hotels, a day-by-day plan.", source: "openclaw-workspace", eligible: true, disabled: false, filePath: "/Users/you/.openclaw/workspace-main/skills/trip-planner/SKILL.md", emoji: "🧳" },
+  { name: "github", skillKey: "github", description: "Work with GitHub issues and pull requests via the gh CLI.", source: "openclaw-bundled", eligible: false, disabled: false, missing: { bins: ["gh"], env: [] }, install: [{ id: "brew", kind: "brew", label: "Install GitHub CLI (brew)", bins: ["gh"] }], emoji: "🐙" },
+  { name: "weather", skillKey: "weather", description: "Current weather and forecasts.", source: "openclaw-bundled", eligible: true, disabled: false, emoji: "🌤️" },
+  { name: "spotify", skillKey: "spotify", description: "Control Spotify playback.", source: "openclaw-managed", eligible: false, disabled: true, emoji: "🎧" },
+];
+
+const mockToolGroups = [
+  { id: "core", label: "Built-in", source: "core", tools: [
+    { id: "browser", label: "browser", description: "Drive a real web browser: open pages, click, type, read.", source: "core" },
+    { id: "exec", label: "exec", description: "Run shell commands on the gateway host.", source: "core", risk: "high" },
+    { id: "read", label: "read", description: "Read files in the workspace.", source: "core" },
+    { id: "web_fetch", label: "web_fetch", description: "Fetch a URL and return readable text.", source: "core" },
+  ] },
+  { id: "plugin:slack", label: "Slack", source: "plugin", pluginId: "slack", tools: [{ id: "slack_post", label: "slack_post", description: "Post a message to a Slack channel.", source: "plugin", pluginId: "slack" }] },
+];
+
+const browserState = { url: "https://www.trattoria.example/reservations", title: "Trattoria — Reservations", clicks: [] as Array<{ x: number; y: number }> };
+const streams = new Map<number, number>();
+let streamSeq = 0;
+
+async function mockFrame(): Promise<ArrayBuffer> {
+  const w = 1280, h = 800;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#fffaf6";
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = "#ff7a45";
+  ctx.fillRect(0, 0, w, 90);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 40px -apple-system, sans-serif";
+  ctx.fillText(browserState.title, 40, 60);
+  ctx.fillStyle = "#1d1a18";
+  ctx.font = "28px -apple-system, sans-serif";
+  ctx.fillText(browserState.url, 40, 160);
+  ctx.fillText(`Live mock frame · ${new Date().toLocaleTimeString()}`, 40, 220);
+  ctx.fillStyle = "#34c759";
+  ctx.fillRect(40, 280, 320, 80);
+  ctx.fillStyle = "#fff";
+  ctx.fillText("Book a table", 110, 330);
+  for (const c of browserState.clicks.slice(-5)) {
+    ctx.fillStyle = "rgba(255,69,58,0.8)";
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 14, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const blob = await new Promise<Blob>((r) => canvas.toBlob((b) => r(b!), "image/jpeg", 0.7));
+  const jpeg = new Uint8Array(await blob.arrayBuffer());
+  const header = new TextEncoder().encode(JSON.stringify({ url: browserState.url, cssWidth: w, cssHeight: h, scrollX: 0, scrollY: 0 }));
+  const out = new Uint8Array(1 + 4 + header.length + jpeg.length);
+  out[0] = 1;
+  new DataView(out.buffer).setUint32(1, header.length);
+  out.set(header, 5);
+  out.set(jpeg, 5 + header.length);
+  return out.buffer;
+}
+
+function browserRequest(p: Record<string, unknown>): unknown {
+  const body = (p.body ?? {}) as Record<string, unknown>;
+  const route = `${p.method} ${p.path}`;
+  if (route === "GET /") return { enabled: true, running: true, profile: "openclaw", cdpReady: true };
+  if (route === "GET /tabs") return { running: true, tabs: [
+    { targetId: "t1", title: browserState.title, url: browserState.url, type: "page" },
+    { targetId: "t2", title: "Google Flights", url: "https://www.google.com/travel/flights", type: "page" },
+  ] };
+  if (route === "POST /navigate") {
+    browserState.url = String(body.url);
+    browserState.title = browserState.url.replace(/^https?:\/\//, "").split("/")[0];
+    return { ok: true, url: browserState.url };
+  }
+  if (route === "POST /act" && body.kind === "clickCoords") {
+    browserState.clicks.push({ x: Number(body.x), y: Number(body.y) });
+    return { ok: true };
+  }
+  return { ok: true };
+}
+
 async function gwCall(gateway: string, method: string, p: Record<string, unknown>): Promise<unknown> {
   await new Promise((r) => setTimeout(r, 120));
   switch (method) {
@@ -225,6 +358,36 @@ async function gwCall(gateway: string, method: string, p: Record<string, unknown
       return { models: [{ id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" }, { id: "claude-sonnet-5", name: "Claude Sonnet 5", provider: "anthropic" }, { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", provider: "openai" }] };
     case "agents.files.get":
       return { agentId: p.agentId, workspace: "", file: { name: p.name, content: "# SOUL.md\n", hash: "x" } };
+    case "agents.workspace.list":
+      return workspaceList(String(p.path ?? ""));
+    case "agents.workspace.get":
+      return workspaceGet(String(p.path));
+    case "skills.status":
+      return gateway === "acp-claude"
+        ? { skills: [
+            { name: "review", skillKey: "cmd:review", description: "Review the current diff", source: "command", eligible: true, hint: "[files]" },
+            { name: "init", skillKey: "cmd:init", description: "Write a CLAUDE.md for this repo", source: "command", eligible: true },
+            { name: "graphify", skillKey: "graphify", description: "Turn anything into a knowledge graph.", source: "personal", eligible: true, filePath: "~/.claude/skills/graphify/SKILL.md" },
+          ] }
+        : { workspaceDir: "/Users/you/.openclaw/workspace-main", skills: mockSkills };
+    case "skills.read":
+      return { name: p.name, path: `~/.claude/skills/${p.name}/SKILL.md`, content: "---\nname: graphify\n---\n\n# graphify\n\nBuilds a knowledge graph from code and docs.\n" };
+    case "tools.effective":
+    case "tools.catalog":
+      return { groups: mockToolGroups };
+    case "plugins.list":
+      return { plugins: [
+        { id: "slack", name: "Slack", description: "Talk to your guys from Slack.", version: "2026.9.4", installed: true, enabled: true, state: "enabled", kind: ["channel"] },
+        { id: "browser", name: "Browser", description: "Managed Chrome for agents.", version: "2026.9.4", installed: true, enabled: true, state: "enabled" },
+        { id: "voice-call", name: "Voice calls", installed: true, enabled: false, state: "disabled" },
+        { id: "matrix", name: "Matrix", installed: false, state: "not-installed" },
+      ] };
+    case "mcp.servers.list":
+      return { servers: [{ name: "playwright", transport: "stdio", command: "npx", enabled: true, source: "~/.claude.json" }] };
+    case "config.get":
+      return { hash: "h", parsed: { mcp: { servers: { linear: { url: "https://mcp.linear.app/sse?token=secret", type: "sse" }, files: { command: "/usr/local/bin/mcp-files", env: { KEY: "secret" } } } } } };
+    case "browser.request":
+      return browserRequest(p);
     default:
       return { ok: true };
   }
@@ -240,6 +403,18 @@ export const mockBackend: Backend = {
         return roster as T;
       case "gw_call":
         return (await gwCall(String(args?.gateway), String(args?.method), (args?.params ?? {}) as Record<string, unknown>)) as T;
+      case "browser_stream_start": {
+        const channel = args?.onMessage as { onmessage: (buf: ArrayBuffer) => void };
+        const id = ++streamSeq;
+        const ready = new TextEncoder().encode(JSON.stringify({ type: "ready", targetId: "t1", url: browserState.url, title: browserState.title }));
+        channel.onmessage(new Uint8Array([0, ...ready]).buffer);
+        streams.set(id, window.setInterval(async () => channel.onmessage(await mockFrame()), 500));
+        return { id, targetId: "t1", url: browserState.url } as T;
+      }
+      case "browser_stream_stop":
+        clearInterval(streams.get(Number(args?.id)));
+        streams.delete(Number(args?.id));
+        return undefined as T;
       case "doctor_check":
         return doctor as T;
       case "set_guy_hidden": {

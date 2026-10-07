@@ -85,7 +85,7 @@ impl AcpClient {
             gateway_id: id.clone(),
             gateway_name: name.clone(),
             kind: RuntimeKind::Acp,
-            capabilities: capabilities(false),
+            capabilities: capabilities(false, config.transport == AcpTransport::Stdio),
             mode: Some(transport_mode(&config)),
             url: Some(describe_endpoint(&config)),
             config_path: dir.display().to_string(),
@@ -117,6 +117,7 @@ impl AcpClient {
                 replays: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 list_cache: Mutex::new(None),
+                commands: Mutex::new(Vec::new()),
                 tried_auth: AtomicBool::new(false),
                 scheduler,
             }),
@@ -188,7 +189,8 @@ impl AcpClient {
     }
 }
 
-fn capabilities(attachments: bool) -> Capabilities {
+/// `local`: the agent runs on this Mac (stdio), so its folders can be read directly.
+fn capabilities(attachments: bool, local: bool) -> Capabilities {
     Capabilities {
         manage_guys: false,
         routines: true,
@@ -198,6 +200,11 @@ fn capabilities(attachments: bool) -> Capabilities {
         new_threads: true,
         attachments,
         models: false,
+        files: local,
+        skills: true,
+        tools: false,
+        plugins: local,
+        browser: false,
     }
 }
 
@@ -264,6 +271,8 @@ struct Inner {
     replays: Mutex<HashMap<String, Replay>>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
     list_cache: Mutex<Option<(Instant, Vec<Value>)>>,
+    /// The agent's slash commands (latest `available_commands_update`).
+    commands: Mutex<Vec<Value>>,
     tried_auth: AtomicBool,
     scheduler: Arc<LocalScheduler>,
 }
@@ -681,7 +690,7 @@ async fn handshake(inner: &Arc<Inner>, conn: &Arc<Conn>) -> Result<(), Outcome> 
         s.phase = if auth_missing { Phase::AuthFailed } else { Phase::Connected };
         s.message = auth_missing.then_some(hint);
         s.server_version = server_version;
-        s.capabilities = capabilities(image);
+        s.capabilities = capabilities(image, inner.config.transport == AcpTransport::Stdio);
         s.hello = Some(hello);
         s.retry_at_ms = None;
     });
@@ -1197,6 +1206,12 @@ impl Inner {
                 self.set_agent_title(sid, title.as_str());
             }
         }
+        if kind == "available_commands_update" {
+            if let Some(commands) = update.get("availableCommands").and_then(Value::as_array) {
+                *self.commands.lock().unwrap() = commands.clone();
+            }
+            return;
+        }
         {
             let mut replays = self.replays.lock().unwrap();
             if let Some(replay) = replays.get_mut(sid) {
@@ -1392,6 +1407,11 @@ impl Inner {
                 Ok(json!({ "approvals": approvals }))
             }
             "exec.approval.resolve" => self.resolve_approval(&params),
+            "agents.workspace.list" | "agents.workspace.get" => self.workspace_call(method, params).await,
+            "skills.status" => self.skills_status(&params).await,
+            "skills.read" => self.skills_read(&params).await,
+            "mcp.servers.list" => self.mcp_servers_list(method, &params).await,
+            "plugins.list" => self.plugins_list(method).await,
             m if m.starts_with("cron.") => self.scheduler.handle(m, params).await,
             other => Err(unsupported(other)),
         }
@@ -2114,6 +2134,609 @@ fn build_prompt(
         }
     }
     Ok((prompt, shown))
+}
+
+// ============================================================================
+// The agent's folders on this Mac: workspace, skills, MCP servers, plugins
+// ============================================================================
+//
+// Read-only and best-effort: missing or broken config files are skipped, and
+// only names / program names / scrubbed URLs ever leave this module (never env
+// values, headers, args or tokens).
+
+const MAX_SKILLS: usize = 300;
+const MAX_SKILL_BYTES: u64 = 256 * 1024;
+/// Front matter lives at the top; no need to read whole SKILL.md files to list them.
+const SKILL_HEAD_BYTES: u64 = 16 * 1024;
+const MAX_SUBDIRS: usize = 1_000;
+/// `~/.claude.json` also keeps per-project history; skip anything absurd.
+const MAX_CONFIG_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Which CLI sits behind the adapter (decides which config folders to read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    Claude,
+    Codex,
+    Gemini,
+    Other,
+}
+
+impl Flavor {
+    fn detect(probe: &str) -> Self {
+        let probe = probe.to_lowercase();
+        if probe.contains("claude") {
+            Self::Claude
+        } else if probe.contains("codex") {
+            Self::Codex
+        } else if probe.contains("gemini") {
+            Self::Gemini
+        } else {
+            Self::Other
+        }
+    }
+}
+
+fn home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/var/empty"))
+}
+
+/// Run file work off the async runtime.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, RpcError> + Send + 'static) -> Result<T, RpcError> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| RpcError::new("INTERNAL", e.to_string()))?
+}
+
+/// `agentId`, when given, must be this bot's.
+fn check_agent(params: &Value) -> Result<(), RpcError> {
+    match param_str(params, &["agentId"]) {
+        Some(id) if id != AGENT_ID => Err(bad_request(&format!("agent \"{id}\" not found"))),
+        _ => Ok(()),
+    }
+}
+
+impl Inner {
+    fn is_local(&self) -> bool {
+        self.config.transport == AcpTransport::Stdio
+    }
+
+    /// From the launch command first, then the names it goes by.
+    fn flavor(&self) -> Flavor {
+        let launch = format!(
+            "{} {} {}",
+            self.config.command.clone().unwrap_or_default(),
+            self.config.args.join(" "),
+            self.config.registry_id.clone().unwrap_or_default()
+        );
+        match Flavor::detect(&launch) {
+            Flavor::Other => Flavor::detect(&format!("{} {}", self.agent().title().unwrap_or_default(), self.config.agent_name)),
+            flavor => flavor,
+        }
+    }
+
+    /// The agent's folder, for calls that read this Mac's disk (stdio agents only).
+    fn local_root(&self, method: &str) -> Result<PathBuf, RpcError> {
+        if !self.is_local() {
+            return Err(unsupported(method));
+        }
+        self.workspace().map_err(|e| RpcError::new("UNAVAILABLE", e))
+    }
+
+    fn skill_dirs(&self) -> Vec<(PathBuf, &'static str)> {
+        let cwd = self.workspace().unwrap_or_else(|_| PathBuf::from(self.cwd_string()));
+        skill_dirs(self.flavor(), &cwd, &home())
+    }
+
+    async fn workspace_call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        check_agent(&params)?;
+        let root = self.local_root(method)?;
+        let method = method.to_string();
+        blocking(move || crate::localfs::handle(&root, AGENT_ID, &method, &params)).await
+    }
+
+    /// Slash commands the agent announced + SKILL.md skills on disk.
+    async fn skills_status(&self, params: &Value) -> Result<Value, RpcError> {
+        check_agent(params)?;
+        let on_disk = if self.is_local() {
+            let dirs = self.skill_dirs();
+            blocking(move || Ok(scan_skills(&dirs))).await?
+        } else {
+            Vec::new()
+        };
+        // Agents often list their skills as commands too; the skill row says more.
+        let skill_names: HashSet<&str> = on_disk.iter().map(|s| s.name.as_str()).collect();
+        let commands = command_skills(&self.commands.lock().unwrap());
+        let mut skills: Vec<Value> =
+            commands.into_iter().filter(|c| !skill_names.contains(c["name"].as_str().unwrap_or_default())).collect();
+        skills.extend(on_disk.iter().map(SkillFile::row));
+        Ok(json!({ "agentId": AGENT_ID, "skills": skills }))
+    }
+
+    async fn skills_read(&self, params: &Value) -> Result<Value, RpcError> {
+        check_agent(params)?;
+        let name = param_str(params, &["name", "skillKey"])
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| bad_request("name is required"))?
+            .to_string();
+        if !self.is_local() {
+            return Err(bad_request(&format!("{name} isn't a skill on this Mac")));
+        }
+        let dirs = self.skill_dirs();
+        blocking(move || {
+            let skill = scan_skills(&dirs)
+                .into_iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| bad_request(&format!("There's no skill called {name}.")))?;
+            let content = read_capped(&skill.path, MAX_SKILL_BYTES)
+                .ok_or_else(|| bad_request(&format!("{} is too big (or unreadable) to show.", skill.path.display())))?;
+            Ok(json!({ "name": skill.name, "path": skill.path.display().to_string(), "content": content }))
+        })
+        .await
+    }
+
+    async fn mcp_servers_list(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        check_agent(params)?;
+        let cwd = self.local_root(method)?;
+        let flavor = self.flavor();
+        let servers = blocking(move || Ok(read_mcp_servers(flavor, &cwd, &home()))).await?;
+        Ok(json!({ "servers": servers }))
+    }
+
+    async fn plugins_list(&self, method: &str) -> Result<Value, RpcError> {
+        let cwd = self.local_root(method)?;
+        let flavor = self.flavor();
+        let plugins = blocking(move || {
+            let home = home();
+            Ok(match flavor {
+                Flavor::Claude => read_claude_plugins(&cwd, &home),
+                Flavor::Gemini => read_gemini_extensions(&home).into_iter().map(|(dir, manifest)| gemini_plugin(&dir, &manifest)).collect(),
+                Flavor::Codex | Flavor::Other => Vec::new(),
+            })
+        })
+        .await?;
+        Ok(json!({ "plugins": plugins }))
+    }
+}
+
+// ---- files ----------------------------------------------------------------------
+
+/// The whole file as text, if it's at most `max` bytes.
+fn read_capped(path: &Path, max: u64) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > max {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// JSON (or JSON5 / JSON with comments) config file.
+fn read_json(path: &Path) -> Option<Value> {
+    let text = read_capped(path, MAX_CONFIG_BYTES)?;
+    serde_json::from_str(&text).ok().or_else(|| json5::from_str(&text).ok())
+}
+
+fn string_set(v: Option<&Value>) -> HashSet<String> {
+    v.and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// Non-hidden subfolders (symlinks followed), sorted.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(reader) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut dirs: Vec<PathBuf> = reader
+        .flatten()
+        .take(MAX_SUBDIRS)
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+// ---- skills ---------------------------------------------------------------------
+
+/// A SKILL.md found on disk.
+#[derive(Debug, Clone)]
+struct SkillFile {
+    name: String,
+    description: Option<String>,
+    /// `project` or `personal`.
+    source: &'static str,
+    path: PathBuf,
+}
+
+impl SkillFile {
+    fn row(&self) -> Value {
+        json!({
+            "name": self.name,
+            "skillKey": self.name,
+            "description": self.description.clone().unwrap_or_default(),
+            "source": self.source,
+            "eligible": true,
+            "disabled": false,
+            "filePath": self.path.display().to_string(),
+        })
+    }
+}
+
+/// Where a flavor keeps its skills; project folders first (they win on name clashes).
+fn skill_dirs(flavor: Flavor, cwd: &Path, home: &Path) -> Vec<(PathBuf, &'static str)> {
+    let own = match flavor {
+        Flavor::Claude => Some(".claude/skills"),
+        Flavor::Codex => Some(".codex/skills"),
+        Flavor::Gemini => Some(".gemini/skills"),
+        Flavor::Other => None,
+    };
+    let folders: Vec<&str> = own.into_iter().chain([".agents/skills"]).collect();
+    let project = folders.iter().map(|f| (cwd.join(f), "project"));
+    let personal = folders.iter().map(|f| (home.join(f), "personal"));
+    project.chain(personal).collect()
+}
+
+/// `<dir>/<skill>/SKILL.md` and `<dir>/<group>/<skill>/SKILL.md`, first name wins.
+fn scan_skills(dirs: &[(PathBuf, &'static str)]) -> Vec<SkillFile> {
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
+    for (dir, source) in dirs {
+        for folder in subdirs(dir) {
+            let nested = if folder.join("SKILL.md").is_file() { vec![folder] } else { subdirs(&folder) };
+            for skill_dir in nested {
+                if found.len() >= MAX_SKILLS {
+                    return found;
+                }
+                let path = skill_dir.join("SKILL.md");
+                let Some(head) = read_head(&path, SKILL_HEAD_BYTES) else { continue };
+                let (name, description) = front_matter(&head);
+                let Some(name) = name.or_else(|| skill_dir.file_name().map(|f| f.to_string_lossy().into_owned())) else { continue };
+                if seen.insert(name.clone()) {
+                    found.push(SkillFile { name, description, source, path });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The first `max` bytes of a file, as text.
+fn read_head(path: &Path, max: u64) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(max).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `name` and `description` from YAML front matter. A tiny line-based reader:
+/// plain, quoted and multi-line values, `>` (folded) and `|` (literal) blocks.
+fn front_matter(text: &str) -> (Option<String>, Option<String>) {
+    let mut lines = text.trim_start_matches('\u{feff}').lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return (None, None);
+    }
+    let body: Vec<&str> = lines.take_while(|l| !matches!(l.trim_end(), "---" | "...")).collect();
+    let (mut name, mut description) = (None, None);
+    let mut i = 0;
+    while i < body.len() {
+        let line = body[i];
+        i += 1;
+        if line.starts_with(char::is_whitespace) || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, head)) = line.split_once(':') else { continue };
+        // Indented (or blank) lines continue the value.
+        let start = i;
+        while i < body.len() && (body[i].trim().is_empty() || body[i].starts_with(char::is_whitespace)) {
+            i += 1;
+        }
+        let value = Some(yaml_value(head.trim(), &body[start..i])).filter(|v| !v.is_empty());
+        match key.trim() {
+            "name" => name = value,
+            "description" => description = value,
+            _ => {}
+        }
+    }
+    (name, description)
+}
+
+fn yaml_value(head: &str, more: &[&str]) -> String {
+    if head.starts_with('>') || head.starts_with('|') {
+        let lines: Vec<&str> = more.iter().map(|l| l.trim()).collect();
+        if head.starts_with('|') {
+            return lines.join("\n").trim().to_string();
+        }
+        // Folded: lines join with spaces, blank lines become line breaks.
+        return lines.split(|l| l.is_empty()).filter(|p| !p.is_empty()).map(|p| p.join(" ")).collect::<Vec<_>>().join("\n");
+    }
+    let mut text = head.to_string();
+    for line in more.iter().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        text.push(' ');
+        text.push_str(line);
+    }
+    let text = text.trim();
+    if text.len() >= 2 && text.starts_with('"') && text.ends_with('"') {
+        let mut out = String::new();
+        let mut chars = text[1..text.len() - 1].chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        }
+        out
+    } else if text.len() >= 2 && text.starts_with('\'') && text.ends_with('\'') {
+        text[1..text.len() - 1].replace("''", "'")
+    } else {
+        // Plain scalars end at a ` #` comment.
+        text.split(" #").next().unwrap_or_default().trim().to_string()
+    }
+}
+
+/// ACP `availableCommands` → skill rows marked `source: "command"`.
+fn command_skills(commands: &[Value]) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    commands
+        .iter()
+        .filter_map(|command| {
+            let name = command.get("name")?.as_str()?.trim().trim_start_matches('/');
+            if name.is_empty() || !seen.insert(name.to_string()) {
+                return None;
+            }
+            let mut row = json!({
+                "name": name,
+                "skillKey": format!("cmd:{name}"),
+                "description": command.get("description").and_then(Value::as_str).unwrap_or_default(),
+                "source": "command",
+                "eligible": true,
+                "disabled": false,
+            });
+            if let Some(hint) = command.pointer("/input/hint").and_then(Value::as_str).filter(|h| !h.trim().is_empty()) {
+                row["hint"] = json!(hint);
+            }
+            Some(row)
+        })
+        .collect()
+}
+
+// ---- MCP servers ----------------------------------------------------------------
+
+/// The agent's MCP servers from its own config files, highest-priority source first.
+fn read_mcp_servers(flavor: Flavor, cwd: &Path, home: &Path) -> Vec<Value> {
+    let mut servers = match flavor {
+        Flavor::Claude => {
+            let mut keys = vec![cwd.display().to_string()];
+            keys.extend(std::fs::canonicalize(cwd).ok().map(|p| p.display().to_string()));
+            claude_mcp(read_json(&home.join(".claude.json")).as_ref(), read_json(&cwd.join(".mcp.json")).as_ref(), &keys)
+        }
+        Flavor::Codex => [(cwd.join(".codex/config.toml"), "project"), (home.join(".codex/config.toml"), "user")]
+            .iter()
+            .filter_map(|(path, source)| read_capped(path, MAX_CONFIG_BYTES).map(|text| codex_mcp(&text, source)))
+            .flatten()
+            .collect(),
+        Flavor::Gemini => {
+            let mut servers = Vec::new();
+            for (path, source) in [(cwd.join(".gemini/settings.json"), "project"), (home.join(".gemini/settings.json"), "user")] {
+                if let Some(settings) = read_json(&path) {
+                    servers.extend(gemini_mcp(&settings, source));
+                }
+            }
+            for (_, manifest) in read_gemini_extensions(home) {
+                servers.extend(mcp_rows(manifest.get("mcpServers"), "extension", "sse"));
+            }
+            servers
+        }
+        Flavor::Other => Vec::new(),
+    };
+    let mut seen = HashSet::new();
+    servers.retain(|s| seen.insert(s["name"].as_str().unwrap_or_default().to_string()));
+    servers.sort_by(|a, b| a["name"].as_str().unwrap_or_default().to_lowercase().cmp(&b["name"].as_str().unwrap_or_default().to_lowercase()));
+    servers
+}
+
+/// Claude Code: `projects["<cwd>"].mcpServers` (local) > `<cwd>/.mcp.json` (project)
+/// > `~/.claude.json` `mcpServers` (user).
+fn claude_mcp(claude_json: Option<&Value>, mcp_json: Option<&Value>, cwd_keys: &[String]) -> Vec<Value> {
+    let project = claude_json.and_then(|c| cwd_keys.iter().find_map(|k| c.get("projects")?.get(k)));
+    let field = |name: &str| project.and_then(|p| p.get(name));
+    let mut servers = mcp_rows(field("mcpServers"), "local", "http");
+    let (approved, rejected) = (string_set(field("enabledMcpjsonServers")), string_set(field("disabledMcpjsonServers")));
+    for mut row in mcp_rows(mcp_json.and_then(|m| m.get("mcpServers")), "project", "http") {
+        let name = row["name"].as_str().unwrap_or_default().to_string();
+        if rejected.contains(&name) {
+            row["enabled"] = json!(false);
+        } else if approved.contains(&name) {
+            row["enabled"] = json!(true);
+        }
+        servers.push(row);
+    }
+    servers.extend(mcp_rows(claude_json.and_then(|c| c.get("mcpServers")), "user", "http"));
+    let disabled = string_set(field("disabledMcpServers"));
+    for row in &mut servers {
+        if disabled.contains(row["name"].as_str().unwrap_or_default()) {
+            row["enabled"] = json!(false);
+        }
+    }
+    servers
+}
+
+/// Codex: `[mcp_servers.<name>]` tables in `config.toml`.
+fn codex_mcp(config_toml: &str, source: &str) -> Vec<Value> {
+    match toml::from_str::<Value>(config_toml) {
+        Ok(config) => mcp_rows(config.get("mcp_servers"), source, "http"),
+        Err(e) => {
+            log::debug!("codex config.toml: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Gemini CLI: `mcpServers` in `settings.json` (`url` = SSE, `httpUrl` = streamable HTTP).
+fn gemini_mcp(settings: &Value, source: &str) -> Vec<Value> {
+    let excluded = string_set(settings.pointer("/mcp/excluded"));
+    let mut servers = mcp_rows(settings.get("mcpServers"), source, "sse");
+    for row in &mut servers {
+        if excluded.contains(row["name"].as_str().unwrap_or_default()) {
+            row["enabled"] = json!(false);
+        }
+    }
+    servers
+}
+
+/// `{name: spec}` → safe rows. `url_transport`: what a bare `url` means.
+fn mcp_rows(servers: Option<&Value>, source: &str, url_transport: &'static str) -> Vec<Value> {
+    let Some(servers) = servers.and_then(Value::as_object) else { return Vec::new() };
+    servers.iter().filter_map(|(name, spec)| mcp_row(name, spec, source, url_transport)).collect()
+}
+
+/// One server, reduced to what's safe to show: name, transport, the program's
+/// file name or a scrubbed URL, and the enabled flag.
+fn mcp_row(name: &str, spec: &Value, source: &str, url_transport: &'static str) -> Option<Value> {
+    let spec = spec.as_object()?;
+    let str_field = |key: &str| spec.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let http_url = str_field("httpUrl");
+    let url = http_url.or_else(|| str_field("url")).or_else(|| str_field("serverUrl"));
+    let declared = str_field("type").or_else(|| str_field("transport")).map(str::to_lowercase);
+    let transport = match declared.as_deref() {
+        Some("stdio") => "stdio",
+        Some("sse") => "sse",
+        Some("http" | "streamable-http" | "streamable_http" | "streamablehttp") => "http",
+        _ if spec.contains_key("command") => "stdio",
+        _ if http_url.is_some() => "http",
+        _ if url.is_some() => url_transport,
+        _ => "stdio",
+    };
+    let mut row = json!({ "name": name, "transport": transport, "source": source });
+    if transport == "stdio" {
+        if let Some(program) = str_field("command").and_then(program_name) {
+            row["command"] = json!(program);
+        }
+    } else if let Some(url) = url.and_then(safe_url) {
+        row["url"] = json!(url);
+    }
+    if let Some(enabled) = spec.get("enabled").and_then(Value::as_bool) {
+        row["enabled"] = json!(enabled);
+    } else if let Some(disabled) = spec.get("disabled").and_then(Value::as_bool) {
+        row["enabled"] = json!(!disabled);
+    }
+    Some(row)
+}
+
+/// Just the program's file name (`/opt/bin/node --x` → `node`); never arguments
+/// or `KEY=value` prefixes.
+fn program_name(command: &str) -> Option<String> {
+    let command = command.trim();
+    let base = |p: &str| Path::new(p).file_name().and_then(|f| f.to_str()).filter(|f| !f.is_empty()).map(str::to_string);
+    let first = command.split_whitespace().find(|t| !t.contains('='))?;
+    match base(command).filter(|b| !b.contains(char::is_whitespace) && !b.contains('=')) {
+        // A path with spaces in folder names (`/Applications/Some App.app/bin/tool`).
+        Some(whole) if first.contains('/') => Some(whole),
+        _ => base(first),
+    }
+}
+
+/// The URL without credentials, query or fragment, and with token-looking path
+/// segments masked. `None` if it isn't a plain web URL.
+fn safe_url(raw: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return None;
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    let looks_secret = |seg: &str| {
+        seg.len() >= 24
+            && seg.chars().any(|c| c.is_ascii_digit())
+            && seg.chars().any(|c| c.is_ascii_alphabetic())
+            && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    let segments: Vec<String> =
+        url.path_segments().map(|s| s.map(|seg| if looks_secret(seg) { "***".to_string() } else { seg.to_string() }).collect()).unwrap_or_default();
+    if !segments.is_empty() {
+        url.set_path(&segments.join("/"));
+    }
+    Some(url.to_string())
+}
+
+// ---- plugins ----------------------------------------------------------------------
+
+fn read_claude_plugins(cwd: &Path, home: &Path) -> Vec<Value> {
+    let Some(installed) = read_json(&home.join(".claude/plugins/installed_plugins.json")) else { return Vec::new() };
+    // Most specific settings first.
+    let settings: Vec<Value> =
+        [cwd.join(".claude/settings.local.json"), cwd.join(".claude/settings.json"), home.join(".claude/settings.json")]
+            .iter()
+            .filter_map(|p| read_json(p))
+            .collect();
+    let enabled: Vec<&Value> = settings.iter().filter_map(|s| s.get("enabledPlugins")).collect();
+    let manifest = |install_path: &str| read_json(&Path::new(install_path).join(".claude-plugin/plugin.json"));
+    claude_plugins(&installed, &enabled, &cwd.display().to_string(), manifest)
+}
+
+/// Claude Code's `installed_plugins.json`: `{version: 2, plugins: {"<name>@<marketplace>":
+/// [{scope, installPath, version, projectPath?, …}]}}` (v1: one object per id), with
+/// the on/off state from settings' `enabledPlugins` (`{"<id>": bool}`, most specific first).
+fn claude_plugins(installed: &Value, enabled: &[&Value], cwd: &str, manifest: impl Fn(&str) -> Option<Value>) -> Vec<Value> {
+    let Some(plugins) = installed.get("plugins").and_then(Value::as_object) else { return Vec::new() };
+    let mut rows = Vec::new();
+    for (id, entries) in plugins {
+        let entries: Vec<&Value> = match entries {
+            Value::Array(list) => list.iter().collect(),
+            other => vec![other],
+        };
+        // Project-scoped installs only count in their own folder.
+        let Some(entry) = entries
+            .into_iter()
+            .find(|e| e.is_object() && e.get("projectPath").and_then(Value::as_str).is_none_or(|p| p == cwd))
+        else {
+            continue;
+        };
+        let manifest = entry.get("installPath").and_then(Value::as_str).and_then(&manifest).unwrap_or(Value::Null);
+        let name = manifest
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| id.split('@').next().unwrap_or(id).to_string());
+        let on = enabled.iter().find_map(|map| map.get(id)).is_some_and(|v| v.as_bool().unwrap_or(!v.is_null()));
+        let mut row = json!({ "id": id, "name": name, "enabled": on, "state": if on { "enabled" } else { "disabled" } });
+        if let Some(version) = entry.get("version").or_else(|| manifest.get("version")).and_then(Value::as_str) {
+            row["version"] = json!(version);
+        }
+        if let Some(description) = manifest.get("description").and_then(Value::as_str) {
+            row["description"] = json!(description);
+        }
+        rows.push(row);
+    }
+    rows.sort_by(|a, b| a["name"].as_str().unwrap_or_default().cmp(b["name"].as_str().unwrap_or_default()));
+    rows
+}
+
+/// `~/.gemini/extensions/<dir>/gemini-extension.json`, by folder name.
+fn read_gemini_extensions(home: &Path) -> Vec<(String, Value)> {
+    subdirs(&home.join(".gemini/extensions"))
+        .into_iter()
+        .filter_map(|dir| {
+            let manifest = read_json(&dir.join("gemini-extension.json"))?;
+            Some((dir.file_name()?.to_string_lossy().into_owned(), manifest))
+        })
+        .collect()
+}
+
+fn gemini_plugin(dir: &str, manifest: &Value) -> Value {
+    let name = manifest.get("name").and_then(Value::as_str).unwrap_or(dir);
+    let mut row = json!({ "id": name, "name": name, "enabled": true, "state": "enabled" });
+    for key in ["version", "description"] {
+        if let Some(value) = manifest.get(key).and_then(Value::as_str) {
+            row[key] = json!(value);
+        }
+    }
+    row
 }
 
 // ============================================================================
@@ -3506,5 +4129,236 @@ mod tests {
         assert_eq!(e.to_rpc().code, "AGENT_ERROR");
         assert_eq!(AcpError::from_wire(&json!({ "code": -32000, "message": "Authentication required" })).to_rpc().code, "AUTH_REQUIRED");
         assert_eq!(AcpError::disconnected().to_rpc().code, "DISCONNECTED");
+    }
+
+    // ---- the agent's folders ----------------------------------------------------------
+
+    /// A scratch folder, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("littleguys-acp-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn write(&self, rel: &str, text: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn front_matter_reads_names_and_descriptions() {
+        let plain = "---\nname: pdf\ndescription: Read and write PDFs # a comment\nlicense: MIT\n---\n# body";
+        assert_eq!(front_matter(plain), (Some("pdf".into()), Some("Read and write PDFs".into())));
+        let quoted = "\u{feff}---\nname: \"graph-it\"\ndescription: \"Say \\\"hi\\\": now\"\n---\n";
+        assert_eq!(front_matter(quoted), (Some("graph-it".into()), Some("Say \"hi\": now".into())));
+        let single = "---\nname: 'it''s'\ndescription: 'a: b'\n---";
+        assert_eq!(front_matter(single), (Some("it's".into()), Some("a: b".into())));
+        let folded = "---\nname: x\ndescription: >-\n  First line\n  continues.\n\n  New paragraph.\nmetadata:\n  name: nested\n---";
+        assert_eq!(front_matter(folded), (Some("x".into()), Some("First line continues.\nNew paragraph.".into())));
+        let literal = "---\ndescription: |\n  one\n  two\nname: y\n---";
+        assert_eq!(front_matter(literal), (Some("y".into()), Some("one\ntwo".into())));
+        let wrapped = "---\nname: z\ndescription: a long\n  wrapped line\n---";
+        assert_eq!(front_matter(wrapped).1.as_deref(), Some("a long wrapped line"));
+        assert_eq!(front_matter("# no front matter\nname: nope"), (None, None));
+        assert_eq!(front_matter("---\nname:\n---"), (None, None));
+    }
+
+    #[test]
+    fn commands_become_skill_rows() {
+        let commands = vec![
+            json!({ "name": "review", "description": "Review the diff", "input": { "hint": "branch or PR" } }),
+            json!({ "name": "/init", "description": "Write AGENTS.md" }),
+            json!({ "name": "review", "description": "dupe" }),
+            json!({ "description": "no name" }),
+        ];
+        let rows = command_skills(&commands);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            json!({ "name": "review", "skillKey": "cmd:review", "description": "Review the diff", "source": "command",
+                    "eligible": true, "disabled": false, "hint": "branch or PR" })
+        );
+        assert_eq!(rows[1]["name"], "init");
+        assert!(rows[1].get("hint").is_none());
+    }
+
+    #[test]
+    fn flavors_pick_their_skill_folders() {
+        assert_eq!(Flavor::detect("npx -y @agentclientprotocol/claude-agent-acp@1 claude-acp"), Flavor::Claude);
+        assert_eq!(Flavor::detect("/opt/homebrew/bin/codex-acp"), Flavor::Codex);
+        assert_eq!(Flavor::detect("npx @google/Gemini-cli --acp"), Flavor::Gemini);
+        assert_eq!(Flavor::detect("opencode acp"), Flavor::Other);
+        let (cwd, home) = (Path::new("/w"), Path::new("/h"));
+        let dirs: Vec<(String, &str)> =
+            skill_dirs(Flavor::Claude, cwd, home).into_iter().map(|(p, s)| (p.display().to_string(), s)).collect();
+        assert_eq!(
+            dirs,
+            [
+                ("/w/.claude/skills".to_string(), "project"),
+                ("/w/.agents/skills".to_string(), "project"),
+                ("/h/.claude/skills".to_string(), "personal"),
+                ("/h/.agents/skills".to_string(), "personal"),
+            ]
+        );
+        assert_eq!(skill_dirs(Flavor::Codex, cwd, home)[2].0, Path::new("/h/.codex/skills"));
+        assert_eq!(skill_dirs(Flavor::Other, cwd, home).len(), 2);
+    }
+
+    #[test]
+    fn skills_are_found_one_or_two_levels_deep() {
+        let project = Scratch::new();
+        let personal = Scratch::new();
+        project.write("pdf/SKILL.md", "---\nname: pdf\ndescription: project pdf\n---\n");
+        project.write("no-front-matter/SKILL.md", "# just text");
+        project.write(".hidden/SKILL.md", "---\nname: hidden\n---");
+        personal.write("pdf/SKILL.md", "---\nname: pdf\ndescription: personal pdf\n---\n");
+        personal.write("group/deep/SKILL.md", "---\nname: deep-one\ndescription: nested\n---\n");
+        personal.write("group/notes.txt", "x");
+        personal.write("empty/readme.md", "x");
+        let skills = scan_skills(&[(project.0.clone(), "project"), (personal.0.clone(), "personal")]);
+        let names: Vec<(&str, &str)> = skills.iter().map(|s| (s.name.as_str(), s.source)).collect();
+        assert_eq!(names, [("no-front-matter", "project"), ("pdf", "project"), ("deep-one", "personal")]);
+        let row = skills[1].row();
+        assert_eq!(row["skillKey"], "pdf");
+        assert_eq!(row["description"], "project pdf");
+        assert_eq!(row["eligible"], true);
+        assert!(row["filePath"].as_str().unwrap().ends_with("pdf/SKILL.md"));
+        assert!(scan_skills(&[(project.0.join("missing"), "project")]).is_empty());
+    }
+
+    #[test]
+    fn claude_mcp_servers_never_leak_secrets() {
+        let claude_json = json!({
+            "mcpServers": {
+                "linear": { "type": "http", "url": "https://user:pw@mcp.linear.app/mcp?token=abc#frag",
+                            "headers": { "Authorization": "Bearer SECRET" } },
+                "shared": { "command": "npx", "args": ["-y", "pkg", "--key=SECRET"] }
+            },
+            "projects": {
+                "/w": {
+                    "mcpServers": { "local-db": { "command": "/usr/local/bin/pg-mcp", "env": { "PGPASSWORD": "SECRET" } } },
+                    "disabledMcpjsonServers": ["off"],
+                    "enabledMcpjsonServers": ["shared"],
+                    "disabledMcpServers": ["linear"]
+                }
+            }
+        });
+        let mcp_json = json!({ "mcpServers": {
+            "off": { "type": "sse", "url": "https://x.dev/sse" },
+            "shared": { "command": "API_KEY=SECRET uvx", "args": ["thing"] }
+        }});
+        let servers = claude_mcp(Some(&claude_json), Some(&mcp_json), &["/w".to_string()]);
+        let text = serde_json::to_string(&servers).unwrap();
+        assert!(!text.contains("SECRET") && !text.contains("pw") && !text.contains("token") && !text.contains("frag"), "{text}");
+        assert_eq!(servers[0], json!({ "name": "local-db", "transport": "stdio", "command": "pg-mcp", "source": "local" }));
+        assert_eq!(servers[1], json!({ "name": "off", "transport": "sse", "url": "https://x.dev/sse", "source": "project", "enabled": false }));
+        assert_eq!(servers[2], json!({ "name": "shared", "transport": "stdio", "command": "uvx", "source": "project", "enabled": true }));
+        assert_eq!(
+            servers[3],
+            json!({ "name": "linear", "transport": "http", "url": "https://mcp.linear.app/mcp", "source": "user", "enabled": false })
+        );
+        assert_eq!(servers[4]["command"], "npx");
+        assert!(claude_mcp(None, None, &[]).is_empty());
+    }
+
+    #[test]
+    fn codex_and_gemini_mcp_servers() {
+        // An installed program whose path has spaces.
+        let apps = Scratch::new();
+        apps.write("Some App.app/bin/node_repl", "#!/bin/sh");
+        let program = apps.0.join("Some App.app/bin/node_repl");
+        let toml = r#"
+model = "o3"
+[mcp_servers.node_repl]
+command = "PROGRAM"
+args = ["--secret", "SECRET"]
+[mcp_servers.node_repl.env]
+TOKEN = "SECRET"
+[mcp_servers.docs]
+url = "https://developers.openai.com/mcp"
+bearer_token_env_var = "SECRET"
+[mcp_servers.off]
+command = "thing"
+enabled = false
+"#
+        .replace("PROGRAM", &program.display().to_string());
+        let servers = codex_mcp(&toml, "user");
+        assert!(!serde_json::to_string(&servers).unwrap().contains("SECRET"));
+        assert_eq!(servers.len(), 3);
+        let by_name = |n: &str| servers.iter().find(|s| s["name"] == n).unwrap().clone();
+        assert_eq!(by_name("node_repl")["command"], "node_repl");
+        assert_eq!(by_name("docs"), json!({ "name": "docs", "transport": "http", "url": "https://developers.openai.com/mcp", "source": "user" }));
+        assert_eq!(by_name("off")["enabled"], false);
+        assert!(codex_mcp("not [valid toml", "user").is_empty());
+
+        let settings = json!({
+            "mcpServers": {
+                "sse": { "url": "http://localhost:8080/sse" },
+                "streamable": { "httpUrl": "https://api.example.com/mcp/AbCdEf0123456789AbCdEf0123", "headers": { "X-Key": "SECRET" } },
+                "local": { "command": "python3", "args": ["server.py"], "env": { "K": "SECRET" } }
+            },
+            "mcp": { "excluded": ["local"] }
+        });
+        let servers = gemini_mcp(&settings, "user");
+        assert!(!serde_json::to_string(&servers).unwrap().contains("SECRET"));
+        let by_name = |n: &str| servers.iter().find(|s| s["name"] == n).unwrap().clone();
+        assert_eq!(by_name("sse")["transport"], "sse");
+        assert_eq!(by_name("streamable")["transport"], "http");
+        assert_eq!(by_name("streamable")["url"], "https://api.example.com/mcp/***");
+        assert_eq!(by_name("local")["command"], "python3");
+        assert_eq!(by_name("local")["enabled"], false);
+    }
+
+    #[test]
+    fn program_names_and_urls_are_scrubbed() {
+        assert_eq!(program_name("npx").as_deref(), Some("npx"));
+        assert_eq!(program_name("/opt/homebrew/bin/uvx --from x").as_deref(), Some("uvx"));
+        assert_eq!(program_name("TOKEN=abc node").as_deref(), Some("node"));
+        assert_eq!(program_name("./Codex Computer Use.app/Contents/MacOS/Client").as_deref(), Some("Client"));
+        assert_eq!(program_name("TOKEN=abc /usr/bin/node").as_deref(), Some("node"));
+        assert_eq!(program_name("   "), None);
+        assert_eq!(safe_url("wss://a:b@host:9/x?y=1").as_deref(), Some("wss://host:9/x"));
+        assert_eq!(safe_url("file:///etc/passwd"), None);
+        assert_eq!(safe_url("not a url"), None);
+    }
+
+    #[test]
+    fn claude_plugins_follow_enabled_plugins() {
+        let installed = json!({
+            "version": 2,
+            "plugins": {
+                "frontend-design@claude-plugins-official": [{ "scope": "user", "installPath": "/p/fd", "version": "d4226d062928" }],
+                "lsp@claude-plugins-official": [{ "scope": "user", "installPath": "/p/lsp", "version": "1.0.0" }],
+                "elsewhere@m": [{ "scope": "project", "projectPath": "/other", "installPath": "/p/e", "version": "1" }],
+                "legacy@m": { "installPath": "/p/legacy", "version": "0.1" }
+            }
+        });
+        let user = json!({ "frontend-design@claude-plugins-official": true, "lsp@claude-plugins-official": true, "legacy@m": true });
+        let project = json!({ "lsp@claude-plugins-official": false });
+        let manifest = |path: &str| (path == "/p/fd").then(|| json!({ "name": "frontend-design", "description": "Make it pretty" }));
+        let plugins = claude_plugins(&installed, &[&project, &user], "/w", manifest);
+        assert_eq!(
+            plugins,
+            [
+                json!({ "id": "frontend-design@claude-plugins-official", "name": "frontend-design", "version": "d4226d062928",
+                        "description": "Make it pretty", "enabled": true, "state": "enabled" }),
+                json!({ "id": "legacy@m", "name": "legacy", "version": "0.1", "enabled": true, "state": "enabled" }),
+                json!({ "id": "lsp@claude-plugins-official", "name": "lsp", "version": "1.0.0", "enabled": false, "state": "disabled" }),
+            ]
+        );
+        assert!(claude_plugins(&json!({}), &[], "/w", |_: &str| None).is_empty());
+        let ext = gemini_plugin("dir", &json!({ "name": "gemini-ext", "version": "1.2.3", "mcpServers": {} }));
+        assert_eq!(ext, json!({ "id": "gemini-ext", "name": "gemini-ext", "version": "1.2.3", "enabled": true, "state": "enabled" }));
     }
 }

@@ -380,6 +380,8 @@ struct State {
     profiles_loaded: bool,
     /// key → (latest message text seen here, ms): Hermes' row preview is the *first* message.
     last_text: HashMap<String, (String, u64)>,
+    /// profile ("" = Hermes' default) → (workspace root, fetched at ms).
+    workspace_roots: HashMap<String, (String, u64)>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -412,7 +414,8 @@ fn spawn<F: Future<Output = ()> + Send + 'static>(fut: F) {
     }
 }
 
-fn capabilities(_mode: HermesMode) -> Capabilities {
+fn capabilities(mode: HermesMode) -> Capabilities {
+    let local = mode == HermesMode::Local;
     Capabilities {
         manage_guys: false,
         routines: true,
@@ -422,6 +425,11 @@ fn capabilities(_mode: HermesMode) -> Capabilities {
         new_threads: true,
         attachments: false,
         models: false,
+        files: local,
+        skills: true,
+        tools: true,
+        plugins: local,
+        browser: false,
     }
 }
 
@@ -561,6 +569,16 @@ impl HermesClient {
             "exec.approval.resolve" => approval_resolve(inner, &params, timeout).await,
             "cron.list" | "cron.get" | "cron.add" | "cron.update" | "cron.remove" | "cron.run" | "cron.runs"
             | "cron.status" => cron_call(inner, method, &params, timeout).await,
+            "agents.workspace.list" | "agents.workspace.get" | "skills.read" if api => Err(unsupported(method)),
+            "agents.workspace.list" => workspace_list(inner, &params, timeout).await,
+            "agents.workspace.get" => workspace_get(inner, &params, timeout).await,
+            "skills.status" => skills_status(inner, &params, timeout).await,
+            "skills.read" => skills_read(inner, &params, timeout).await,
+            "tools.effective" | "tools.catalog" => tools_groups(inner, &params, timeout).await,
+            "plugins.list" if api => Ok(json!({ "plugins": [] })),
+            "plugins.list" => plugins_list(inner, &params, timeout).await,
+            "mcp.servers.list" if api => Ok(json!({ "servers": [] })),
+            "mcp.servers.list" => mcp_servers_list(inner, &params, timeout).await,
             other => Err(unsupported(other)),
         }
     }
@@ -715,6 +733,7 @@ fn disconnected(inner: &Inner) {
         st.cron_check_scheduled = false;
         st.sessions_emit_scheduled = false;
         st.profiles_loaded = false;
+        st.workspace_roots.clear();
         if inner.config.mode == HermesMode::Local {
             st.approvals.drain().map(|(id, _)| id).collect()
         } else {
@@ -3250,6 +3269,508 @@ async fn cron_check(inner: &Arc<Inner>) {
     }
 }
 
+// ---- workspace, skills, tools, plugins, MCP (read-only) ------------------------------
+//
+// Local mode reads the dashboard REST API (`/api/fs/*`, `/api/skills`, `/api/tools/toolsets`,
+// `/api/mcp/servers`, all `?profile=`-scoped) plus two WS methods; api mode only has
+// `/v1/skills` and `/v1/toolsets`. Nothing here writes.
+
+/// How long a guy's workspace root (`/api/fs/default-cwd`) is trusted.
+const WORKSPACE_ROOT_TTL_MS: u64 = 60_000;
+/// `agents.workspace.get` caps (Hermes itself previews ≤ 512 KB of text, data URLs ≤ 16 MB).
+const PREVIEW_TEXT_MAX: usize = 256 * 1024;
+const PREVIEW_IMAGE_MAX: u64 = 5 * 1024 * 1024;
+/// Binary files littleguys previews (extension → mime).
+const PREVIEW_IMAGES: &[(&str, &str)] = &[
+    ("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"), ("gif", "image/gif"), ("webp", "image/webp"),
+    ("bmp", "image/bmp"), ("avif", "image/avif"), ("heic", "image/heic"),
+];
+
+/// The Hermes profile behind `agentId` (agent id = profile name); `None` = Hermes' default.
+fn agent_profile(inner: &Inner, params: &Value) -> Result<Option<String>, RpcError> {
+    match params.get("agentId").and_then(Value::as_str).map(str::trim).filter(|a| !a.is_empty()) {
+        Some(agent) if profile_allowed(inner, agent) => Ok(Some(agent.to_string())),
+        Some(agent) => Err(RpcError::new("INVALID_REQUEST", format!("unknown guy {agent}"))),
+        None => Ok(inner.config.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string)),
+    }
+}
+
+/// `path?k=v&…` with percent-encoded values; `None` values are left out.
+fn with_query(path: &str, query: &[(&str, Option<&str>)]) -> String {
+    let parts: Vec<String> = query.iter().filter_map(|(k, v)| v.map(|v| format!("{k}={}", enc(v)))).collect();
+    if parts.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", parts.join("&"))
+    }
+}
+
+/// A non-empty, trimmed string field.
+fn nonempty<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Rows of a bare array, `{<key>: […]}` or an OpenAI-style `{data: […]}`.
+fn list_of<'a>(v: &'a Value, key: &str) -> &'a [Value] {
+    v.as_array()
+        .or_else(|| v.get(key).and_then(Value::as_array))
+        .or_else(|| v.get("data").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// The separator a backend path uses (`\` only for Windows-looking paths).
+fn dir_sep(path: &str) -> char {
+    if path.contains('\\') && !path.contains('/') {
+        '\\'
+    } else {
+        '/'
+    }
+}
+
+/// A directory without trailing separators; filesystem roots (`/`, `C:\`) keep theirs.
+fn trim_dir(dir: &str) -> String {
+    let dir = dir.trim();
+    let trimmed = dir.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        match dir[trimmed.len()..].chars().next() {
+            Some(sep) => format!("{trimmed}{sep}"),
+            None => dir.to_string(),
+        }
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// UI path ("" = root) → normalized workspace-relative path. Absolute paths and `..` are refused.
+fn workspace_rel(path: &str) -> Result<String, RpcError> {
+    let path = path.trim();
+    let outside = || RpcError::new("INVALID_REQUEST", format!("{path:?} isn't a path inside the workspace"));
+    let bytes = path.as_bytes();
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if path.starts_with(['/', '\\']) || drive || path.contains('\0') {
+        return Err(outside());
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            // `\` is a separator on Windows backends: no `..` hiding behind it either.
+            p if p.split('\\').any(|s| s == "..") => return Err(outside()),
+            p => parts.push(p),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// Workspace-relative path → the backend's absolute path.
+fn workspace_abs(root: &str, rel: &str) -> String {
+    if rel.is_empty() {
+        return root.to_string();
+    }
+    let sep = dir_sep(root);
+    let rel = if sep == '/' { rel.to_string() } else { rel.replace('/', "\\") };
+    if root.ends_with(sep) {
+        format!("{root}{rel}")
+    } else {
+        format!("{root}{sep}{rel}")
+    }
+}
+
+/// A backend absolute path → workspace-relative (`/`-separated), or `None` when it isn't
+/// inside the root (e.g. a symlink Hermes resolved to somewhere else).
+fn workspace_relative(root: &str, abs: &str) -> Option<String> {
+    let root = trim_dir(root);
+    let abs = trim_dir(abs);
+    if abs == root {
+        return Some(String::new());
+    }
+    let sep = dir_sep(&root);
+    let rest = abs.strip_prefix(root.as_str())?;
+    let rest = if root.ends_with(sep) { rest } else { rest.strip_prefix(sep)? };
+    let rel = if sep == '/' { rest.to_string() } else { rest.replace('\\', "/") };
+    let clean = !rel.is_empty() && rel.split('/').all(|p| !p.is_empty() && p != "." && p != "..");
+    clean.then_some(rel)
+}
+
+fn parent_of(rel: &str) -> &str {
+    rel.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
+}
+
+/// The guy's workspace: Hermes' default working directory for the profile (cached a minute).
+async fn workspace_root(inner: &Inner, profile: Option<&str>, timeout: Duration) -> Result<String, RpcError> {
+    let key = profile.unwrap_or_default().to_string();
+    if let Some((root, at)) = inner.st.lock().unwrap().workspace_roots.get(&key).cloned() {
+        if now_ms().saturating_sub(at) < WORKSPACE_ROOT_TTL_MS {
+            return Ok(root);
+        }
+    }
+    let path = with_query("/api/fs/default-cwd", &[("profile", profile)]);
+    let v = rest(inner, reqwest::Method::GET, &path, None, timeout).await?;
+    let root = nonempty(&v, "cwd")
+        .map(trim_dir)
+        .ok_or_else(|| RpcError::new("UNAVAILABLE", "Hermes didn't say which folder this guy works in."))?;
+    inner.st.lock().unwrap().workspace_roots.insert(key, (root.clone(), now_ms()));
+    Ok(root)
+}
+
+/// `/api/fs/list` answer (`{entries:[{name, path, isDirectory}], error?}`) → OpenClaw's
+/// workspace listing: dirs first, by name, paged; entries outside the root are dropped.
+fn workspace_listing(agent_id: &str, root: &str, rel: &str, raw: &Value, offset: usize, limit: usize) -> Result<Value, RpcError> {
+    if let Some(err) = nonempty(raw, "error") {
+        let shown = if rel.is_empty() { "The workspace" } else { rel };
+        return Err(match err {
+            "ENOENT" => RpcError::new("NOT_FOUND", format!("{shown} doesn't exist.")),
+            "ENOTDIR" => RpcError::new("INVALID_REQUEST", format!("{shown} isn't a folder.")),
+            "EACCES" => RpcError::new("INVALID_REQUEST", format!("Hermes isn't allowed to read {shown}.")),
+            other => RpcError::new("UNAVAILABLE", format!("Hermes couldn't list {shown}: {other}")),
+        });
+    }
+    let mut entries: Vec<(bool, &str, String)> = list_of(raw, "entries")
+        .iter()
+        .filter_map(|e| {
+            let name = nonempty(e, "name")?;
+            let path = workspace_relative(root, e.get("path").and_then(Value::as_str)?).filter(|p| !p.is_empty())?;
+            Some((e.get("isDirectory").and_then(Value::as_bool).unwrap_or(false), name, path))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())).then_with(|| a.1.cmp(b.1)));
+    let total = entries.len();
+    let page: Vec<Value> = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(dir, name, path)| json!({ "path": path, "name": name, "kind": if dir { "directory" } else { "file" } }))
+        .collect();
+    let mut out = json!({ "agentId": agent_id, "path": rel, "entries": page, "totalEntries": total, "offset": offset });
+    if !rel.is_empty() {
+        out["parentPath"] = json!(parent_of(rel));
+    }
+    Ok(out)
+}
+
+async fn workspace_list(inner: &Inner, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
+    let profile = agent_profile(inner, params)?;
+    let agent_id = profile.clone().unwrap_or_else(|| api_agent_id(inner));
+    let rel = workspace_rel(params.get("path").and_then(Value::as_str).unwrap_or(""))?;
+    let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(250).clamp(1, 500) as usize;
+    let root = workspace_root(inner, profile.as_deref(), timeout).await?;
+    let abs = workspace_abs(&root, &rel);
+    let path = with_query("/api/fs/list", &[("path", Some(abs.as_str())), ("profile", profile.as_deref())]);
+    let raw = rest(inner, reqwest::Method::GET, &path, None, timeout).await?;
+    workspace_listing(&agent_id, &root, &rel, &raw, offset, limit)
+}
+
+#[derive(Debug, PartialEq)]
+enum Preview {
+    Text(Value),
+    /// A binary image to fetch as a data URL.
+    Image { mime: &'static str, size: u64 },
+}
+
+fn image_mime(name: &str, mime: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    PREVIEW_IMAGES.iter().find(|(e, m)| ext.as_deref() == Some(*e) || *m == mime).map(|(_, m)| *m)
+}
+
+/// `/api/fs/read-text` answer (`{text, binary, byteSize, mimeType, path, truncated}`) → the
+/// file, or the image to fetch instead. Other binaries (and symlinks out of the root) can't be shown.
+fn file_preview(root: &str, rel: &str, r: &Value) -> Result<Preview, RpcError> {
+    if let Some(resolved) = nonempty(r, "path") {
+        if workspace_relative(root, resolved).is_none() {
+            return Err(RpcError::new("INVALID_REQUEST", format!("{rel} points outside the workspace.")));
+        }
+    }
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let text = r.get("text").and_then(Value::as_str).unwrap_or("");
+    let size = r.get("byteSize").and_then(Value::as_u64).unwrap_or(text.len() as u64);
+    let mime = nonempty(r, "mimeType").unwrap_or("application/octet-stream");
+    if r.get("binary").and_then(Value::as_bool).unwrap_or(false) {
+        let Some(mime) = image_mime(name, mime) else {
+            return Err(RpcError::new("INVALID_REQUEST", format!("{name} is a binary file; littleguys can't preview it.")));
+        };
+        if size > PREVIEW_IMAGE_MAX {
+            let mb = size as f64 / (1024.0 * 1024.0);
+            return Err(RpcError::new("INVALID_REQUEST", format!("{name} is too big to preview ({mb:.1} MB; images up to 5 MB).")));
+        }
+        return Ok(Preview::Image { mime, size });
+    }
+    let mut end = text.len().min(PREVIEW_TEXT_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mime = if mime == "application/octet-stream" { "text/plain" } else { mime };
+    let mut file = json!({ "path": rel, "name": name, "size": size, "mimeType": mime, "encoding": "utf8", "content": &text[..end] });
+    if end < text.len() || r.get("truncated").and_then(Value::as_bool).unwrap_or(false) {
+        file["truncated"] = json!(true);
+    }
+    Ok(Preview::Text(file))
+}
+
+/// `data:<mime>;base64,<payload>` → payload.
+fn data_url_base64(url: &str) -> Option<&str> {
+    url.strip_prefix("data:")?.split_once(";base64,").map(|(_, b64)| b64)
+}
+
+async fn workspace_get(inner: &Inner, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
+    let profile = agent_profile(inner, params)?;
+    let agent_id = profile.clone().unwrap_or_else(|| api_agent_id(inner));
+    let rel = workspace_rel(params.get("path").and_then(Value::as_str).unwrap_or(""))?;
+    if rel.is_empty() {
+        return Err(RpcError::new("INVALID_REQUEST", "path is required"));
+    }
+    let root = workspace_root(inner, profile.as_deref(), timeout).await?;
+    let abs = workspace_abs(&root, &rel);
+    let query = [("path", Some(abs.as_str())), ("profile", profile.as_deref())];
+    let text = rest(inner, reqwest::Method::GET, &with_query("/api/fs/read-text", &query), None, timeout).await?;
+    let file = match file_preview(&root, &rel, &text)? {
+        Preview::Text(file) => file,
+        Preview::Image { mime, size } => {
+            let v = rest(inner, reqwest::Method::GET, &with_query("/api/fs/read-data-url", &query), None, timeout).await?;
+            let content = v
+                .get("dataUrl")
+                .and_then(Value::as_str)
+                .and_then(data_url_base64)
+                .ok_or_else(|| RpcError::new("UNAVAILABLE", "Hermes sent an unreadable image."))?;
+            let name = rel.rsplit('/').next().unwrap_or(&rel);
+            json!({ "path": rel, "name": name, "size": size, "mimeType": mime, "encoding": "base64", "content": content })
+        }
+    };
+    Ok(json!({ "agentId": agent_id, "file": file }))
+}
+
+/// One skill row → OpenClaw's skill entry.
+fn skill_entry(s: &Value, source: &str, enabled: bool) -> Option<Value> {
+    let name = nonempty(s, "name")?;
+    let mut out = json!({ "name": name, "skillKey": name, "source": source, "eligible": enabled, "disabled": !enabled });
+    if let Some(d) = nonempty(s, "description") {
+        out["description"] = json!(d);
+    }
+    if let Some(c) = nonempty(s, "category") {
+        out["category"] = json!(c);
+    }
+    if let Some(n) = s.get("usage").and_then(Value::as_u64) {
+        out["usage"] = json!(n);
+    }
+    Some(out)
+}
+
+/// Local `/api/skills` (`[{name, description, category, enabled, usage, provenance}]`).
+fn skills_from_local(v: &Value) -> Vec<Value> {
+    list_of(v, "skills")
+        .iter()
+        .filter_map(|s| {
+            let source = nonempty(s, "provenance").or_else(|| nonempty(s, "category")).unwrap_or("hermes");
+            skill_entry(s, source, s.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+        })
+        .collect()
+}
+
+/// Api `/v1/skills` (`{data:[{name, description, category}]}`): disabled skills aren't listed.
+fn skills_from_api(v: &Value) -> Vec<Value> {
+    list_of(v, "skills").iter().filter_map(|s| skill_entry(s, nonempty(s, "category").unwrap_or("hermes"), true)).collect()
+}
+
+async fn skills_status(inner: &Inner, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
+    let profile = agent_profile(inner, params)?;
+    let agent_id = profile.clone().unwrap_or_else(|| api_agent_id(inner));
+    let skills = match inner.config.mode {
+        HermesMode::Local => {
+            let path = with_query("/api/skills", &[("profile", profile.as_deref())]);
+            skills_from_local(&rest(inner, reqwest::Method::GET, &path, None, timeout).await?)
+        }
+        HermesMode::Api => skills_from_api(&rest(inner, reqwest::Method::GET, "/v1/skills", None, timeout).await?),
+    };
+    Ok(json!({ "agentId": agent_id, "skills": skills }))
+}
+
+async fn skills_read(inner: &Inner, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
+    let profile = agent_profile(inner, params)?;
+    let name = nonempty(params, "name").ok_or_else(|| RpcError::new("INVALID_REQUEST", "name is required"))?;
+    let path = with_query("/api/skills/content", &[("name", Some(name)), ("profile", profile.as_deref())]);
+    let v = rest(inner, reqwest::Method::GET, &path, None, timeout).await?;
+    let mut out = json!({ "name": nonempty(&v, "name").unwrap_or(name), "content": v.get("content").and_then(Value::as_str).unwrap_or("") });
+    if let Some(p) = nonempty(&v, "path") {
+        out["path"] = json!(p);
+    }
+    Ok(out)
+}
+
+/// Hermes toolsets (`/api/tools/toolsets` or `/v1/toolsets`: `{name, label, description,
+/// enabled, configured, tools:[names]}`) → OpenClaw tool groups, disabled ones included.
+fn tool_groups(v: &Value) -> Vec<Value> {
+    list_of(v, "toolsets")
+        .iter()
+        .filter_map(|t| {
+            let name = nonempty(t, "name")?;
+            let tools: Vec<Value> = t
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|id| json!({ "id": id, "label": id }))
+                .collect();
+            let mut group = json!({
+                "id": name,
+                "label": nonempty(t, "label").unwrap_or(name),
+                "source": "toolset",
+                "enabled": t.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                "tools": tools,
+            });
+            if let Some(d) = nonempty(t, "description") {
+                group["description"] = json!(d);
+            }
+            if let Some(c) = t.get("configured").and_then(Value::as_bool) {
+                group["configured"] = json!(c);
+            }
+            Some(group)
+        })
+        .collect()
+}
+
+async fn tools_groups(inner: &Inner, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
+    let profile = agent_profile(inner, params)?;
+    let agent_id = profile.clone().unwrap_or_else(|| api_agent_id(inner));
+    let path = match inner.config.mode {
+        HermesMode::Local => with_query("/api/tools/toolsets", &[("profile", profile.as_deref())]),
+        HermesMode::Api => "/v1/toolsets".to_string(),
+    };
+    let raw = rest(inner, reqwest::Method::GET, &path, None, timeout).await?;
+    Ok(json!({ "agentId": agent_id, "groups": tool_groups(&raw) }))
+}
+
+/// `plugins.manage list` rows (`{name, key, version, description, status}`) or legacy
+/// `plugins.list` rows (`{name, version, enabled}`) → OpenClaw plugin entries.
+fn plugins_out(v: &Value) -> Vec<Value> {
+    list_of(v, "plugins")
+        .iter()
+        .filter_map(|p| {
+            let name = nonempty(p, "name")?;
+            let enabled = match p.get("enabled").and_then(Value::as_bool) {
+                Some(enabled) => enabled,
+                None => nonempty(p, "status") == Some("enabled"),
+            };
+            let mut out = json!({
+                "id": nonempty(p, "key").unwrap_or(name),
+                "name": name,
+                "enabled": enabled,
+                "state": if enabled { "enabled" } else { "disabled" },
+            });
+            if let Some(d) = nonempty(p, "description") {
+                out["description"] = json!(d);
+            }
+            if let Some(version) = nonempty(p, "version").filter(|v| *v != "?") {
+                out["version"] = json!(version);
+            }
+            Some(out)
+        })
+        .collect()
+}
+
+async fn plugins_list(inner: &Inner, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
+    let profile = agent_profile(inner, params)?;
+    let mut list = json!({ "action": "list" });
+    if let Some(profile) = &profile {
+        list["profile"] = json!(profile);
+    }
+    // The Plugins Hub inventory is per profile and describes each plugin; older backends only
+    // have the process-wide `plugins.list` (which takes no params).
+    let raw = match rpc(inner, "plugins.manage", list, timeout).await {
+        Ok(v) => v,
+        Err(e) if matches!(e.code.as_str(), "NOT_CONNECTED" | "DISCONNECTED") => return Err(e),
+        Err(_) => rpc(inner, "plugins.list", json!({}), timeout).await?,
+    };
+    Ok(json!({ "plugins": plugins_out(&raw) }))
+}
+
+/// A server URL without userinfo, query, fragment or token-looking path segments.
+fn safe_url(url: &str) -> Option<String> {
+    let url = url.trim().split(['?', '#']).next().unwrap_or("");
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), url),
+    };
+    let (authority, path) = rest.find('/').map(|i| rest.split_at(i)).unwrap_or((rest, ""));
+    let host = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+    if host.is_empty() {
+        return None;
+    }
+    let looks_secret =
+        |seg: &str| seg.len() >= 16 && seg.chars().any(|c| c.is_ascii_digit()) && seg.chars().any(|c| c.is_ascii_alphabetic());
+    let path: Vec<&str> = path.split('/').map(|seg| if looks_secret(seg) { "…" } else { seg }).collect();
+    Some(format!("{scheme}{host}{}", path.join("/")))
+}
+
+/// The program a stdio server runs: no directory, no arguments.
+fn program_name(command: &str) -> Option<String> {
+    let base = command.trim().rsplit(['/', '\\']).next()?;
+    base.split_whitespace().next().filter(|p| !p.contains('=')).map(str::to_string)
+}
+
+/// Configured MCP servers (`/api/mcp/servers`) + cached runtime state (`mcp.servers.status`:
+/// `{name, transport, tools:int, connected, disabled, status}`). Only names, transports, a
+/// credential-free URL and the program name: never args, env (not even key names), headers or auth.
+fn mcp_servers_out(config: &Value, status: Option<&Value>) -> Vec<Value> {
+    let runtime: Vec<(&str, &Value)> =
+        status.map(|s| list_of(s, "servers")).unwrap_or(&[]).iter().filter_map(|r| Some((nonempty(r, "name")?, r))).collect();
+    let configured = list_of(config, "servers");
+    let mut out = Vec::new();
+    for s in configured.iter().chain(runtime.iter().map(|(_, r)| *r)) {
+        let Some(name) = nonempty(s, "name") else { continue };
+        if out.iter().any(|row: &Value| row["name"] == name) {
+            continue;
+        }
+        let rt = runtime.iter().find(|(n, _)| *n == name).map(|(_, r)| *r);
+        let transport = nonempty(s, "transport").or_else(|| rt.and_then(|r| nonempty(r, "transport"))).unwrap_or("unknown");
+        let mut row = json!({ "name": name, "transport": transport });
+        if let Some(url) = s.get("url").and_then(Value::as_str).and_then(safe_url) {
+            row["url"] = json!(url);
+        }
+        if let Some(program) = s.get("command").and_then(Value::as_str).and_then(program_name) {
+            row["command"] = json!(program);
+        }
+        let disabled = rt.and_then(|r| r.get("disabled")).and_then(Value::as_bool);
+        row["enabled"] = json!(s.get("enabled").and_then(Value::as_bool).or(disabled.map(|d| !d)).unwrap_or(true));
+        let connected = rt.and_then(|r| r.get("connected")).and_then(Value::as_bool);
+        let count = rt.and_then(|r| r.get("tools")).and_then(Value::as_u64).filter(|n| *n > 0 || connected == Some(true));
+        // Config `tools` is the selection: a list of names, or `{include:[…]}`; absent = all.
+        let selected = s.get("tools").and_then(|t| t.as_array().or_else(|| t.get("include").and_then(Value::as_array)));
+        if let Some(n) = count {
+            row["tools"] = json!(n);
+        } else if let Some(names) = selected {
+            row["tools"] = json!(names.iter().filter_map(Value::as_str).collect::<Vec<_>>());
+        }
+        if let Some(status) = rt.and_then(|r| nonempty(r, "status")) {
+            row["status"] = json!(status);
+        }
+        if let Some(connected) = connected {
+            row["connected"] = json!(connected);
+        }
+        if let Some(source) = nonempty(s, "source") {
+            row["source"] = json!(source);
+        }
+        out.push(row);
+    }
+    out
+}
+
+async fn mcp_servers_list(inner: &Inner, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
+    let profile = agent_profile(inner, params)?;
+    let path = with_query("/api/mcp/servers", &[("profile", profile.as_deref())]);
+    let mut status_params = json!({});
+    if let Some(profile) = &profile {
+        status_params["profile"] = json!(profile);
+    }
+    // Runtime state is a nice-to-have: it's cached server-side and never probes.
+    let (config, status) = tokio::join!(
+        rest(inner, reqwest::Method::GET, &path, None, timeout),
+        rpc(inner, "mcp.servers.status", status_params, timeout.min(Duration::from_secs(10))),
+    );
+    Ok(json!({ "servers": mcp_servers_out(&config?, status.ok().as_ref()) }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3507,5 +4028,178 @@ mod tests {
         assert_eq!(tool_output_text(&json!("plain text")), ("plain text".into(), false));
         let blocked = json!({ "output": "", "exit_code": -1, "error": "BLOCKED: denied", "status": "blocked", "user_summary": "You denied this command" });
         assert_eq!(tool_output_text(&blocked), ("BLOCKED: denied".into(), true));
+    }
+
+    #[test]
+    fn maps_workspace_paths() {
+        assert_eq!(workspace_rel("").unwrap(), "");
+        assert_eq!(workspace_rel(" ./src//lib/ ").unwrap(), "src/lib");
+        assert_eq!(workspace_rel("notes/~draft.md").unwrap(), "notes/~draft.md");
+        for bad in ["/etc/passwd", "\\\\server\\share", "C:\\Users", "c:/x", "..", "a/../../b", "a/./..", "a\\..\\..\\b", "a\0b"] {
+            assert!(workspace_rel(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert_eq!(with_query("/api/fs/list", &[("path", Some("/w/a b&c")), ("profile", None)]), "/api/fs/list?path=%2Fw%2Fa%20b%26c");
+        assert_eq!(with_query("/api/skills", &[("profile", None)]), "/api/skills");
+
+        assert_eq!(trim_dir("/Users/me/proj/"), "/Users/me/proj");
+        assert_eq!(trim_dir("/"), "/");
+        assert_eq!(trim_dir("C:\\"), "C:\\");
+        assert_eq!(workspace_abs("/Users/me/proj", ""), "/Users/me/proj");
+        assert_eq!(workspace_abs("/Users/me/proj", "src/main.rs"), "/Users/me/proj/src/main.rs");
+        assert_eq!(workspace_abs("/", "etc"), "/etc");
+        assert_eq!(workspace_abs("C:\\work", "src/a.py"), "C:\\work\\src\\a.py");
+
+        assert_eq!(workspace_relative("/Users/me/proj", "/Users/me/proj/src/a.rs").as_deref(), Some("src/a.rs"));
+        assert_eq!(workspace_relative("/Users/me/proj/", "/Users/me/proj").as_deref(), Some(""));
+        assert_eq!(workspace_relative("/Users/me/proj", "/Users/me/project2/a"), None);
+        assert_eq!(workspace_relative("/Users/me/proj", "/Users/me/other"), None);
+        assert_eq!(workspace_relative("/Users/me/proj", "/Users/me/proj\\x"), None);
+        assert_eq!(workspace_relative("/", "/etc/hosts").as_deref(), Some("etc/hosts"));
+        assert_eq!(workspace_relative("C:\\work", "C:\\work\\src\\a.py").as_deref(), Some("src/a.py"));
+        assert_eq!(parent_of("a/b/c"), "a/b");
+        assert_eq!(parent_of("a"), "");
+    }
+
+    #[test]
+    fn lists_workspace_folders() {
+        let raw = json!({ "entries": [
+            { "name": "zeta.md", "path": "/w/docs/zeta.md", "isDirectory": false },
+            { "name": "Alpha.txt", "path": "/w/docs/Alpha.txt", "isDirectory": false },
+            { "name": "img", "path": "/w/docs/img", "isDirectory": true },
+            { "name": "escape", "path": "/etc/escape", "isDirectory": true },
+            { "name": "beta", "path": "/w/docs/beta", "isDirectory": true },
+        ]});
+        let out = workspace_listing("fox", "/w", "docs", &raw, 0, 250).unwrap();
+        assert_eq!(out["agentId"], "fox");
+        assert_eq!(out["path"], "docs");
+        assert_eq!(out["parentPath"], "");
+        assert_eq!(out["totalEntries"], 4);
+        let names: Vec<&str> = out["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["beta", "img", "Alpha.txt", "zeta.md"]);
+        assert_eq!(out["entries"][0], json!({ "path": "docs/beta", "name": "beta", "kind": "directory" }));
+        assert_eq!(out["entries"][2], json!({ "path": "docs/Alpha.txt", "name": "Alpha.txt", "kind": "file" }));
+
+        let page = workspace_listing("fox", "/w", "docs", &raw, 1, 2).unwrap();
+        assert_eq!(page["offset"], 1);
+        assert_eq!(page["totalEntries"], 4);
+        let names: Vec<&str> = page["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["img", "Alpha.txt"]);
+
+        let root = workspace_listing("fox", "/w", "", &json!({ "entries": [{ "name": "a", "path": "/w/a", "isDirectory": false }] }), 0, 250).unwrap();
+        assert!(root.get("parentPath").is_none());
+        assert_eq!(root["entries"][0]["path"], "a");
+
+        let missing = workspace_listing("fox", "/w", "gone", &json!({ "entries": [], "error": "ENOENT" }), 0, 250).unwrap_err();
+        assert_eq!(missing.code, "NOT_FOUND");
+    }
+
+    #[test]
+    fn previews_workspace_files() {
+        let text = json!({ "text": "# hi", "binary": false, "byteSize": 4, "language": "markdown", "mimeType": "text/markdown",
+            "path": "/w/docs/README.md", "truncated": false });
+        let Preview::Text(file) = file_preview("/w", "docs/README.md", &text).unwrap() else { panic!("expected text") };
+        assert_eq!(file, json!({ "path": "docs/README.md", "name": "README.md", "size": 4, "mimeType": "text/markdown",
+            "encoding": "utf8", "content": "# hi" }));
+
+        let big = "é".repeat(PREVIEW_TEXT_MAX);
+        let long = json!({ "text": big, "binary": false, "byteSize": 900_000, "mimeType": "application/octet-stream", "path": "/w/Makefile", "truncated": true });
+        let Preview::Text(file) = file_preview("/w", "Makefile", &long).unwrap() else { panic!("expected text") };
+        assert_eq!(file["truncated"], true);
+        assert_eq!(file["mimeType"], "text/plain");
+        assert_eq!(file["size"], 900_000);
+        assert!(file["content"].as_str().unwrap().len() <= PREVIEW_TEXT_MAX);
+
+        let png = json!({ "text": "\u{fffd}PNG", "binary": true, "byteSize": 2048, "mimeType": "image/png", "path": "/w/a.png" });
+        assert_eq!(file_preview("/w", "a.png", &png).unwrap(), Preview::Image { mime: "image/png", size: 2048 });
+        let heic = json!({ "binary": true, "byteSize": 10, "mimeType": "application/octet-stream", "path": "/w/IMG.HEIC" });
+        assert_eq!(file_preview("/w", "IMG.HEIC", &heic).unwrap(), Preview::Image { mime: "image/heic", size: 10 });
+        let huge = json!({ "binary": true, "byteSize": 6 * 1024 * 1024, "mimeType": "image/jpeg", "path": "/w/big.jpg" });
+        assert!(file_preview("/w", "big.jpg", &huge).unwrap_err().message.contains("too big"));
+        let zip = json!({ "binary": true, "byteSize": 10, "mimeType": "application/zip", "path": "/w/a.zip" });
+        let err = file_preview("/w", "a.zip", &zip).unwrap_err();
+        assert_eq!(err.code, "INVALID_REQUEST");
+        assert!(err.message.contains("can't preview"));
+        let link = json!({ "text": "secret", "binary": false, "byteSize": 6, "mimeType": "text/plain", "path": "/Users/me/.ssh/id_rsa" });
+        assert!(file_preview("/w", "id_rsa", &link).is_err());
+
+        assert_eq!(data_url_base64("data:image/png;base64,iVBORw0KGgo="), Some("iVBORw0KGgo="));
+        assert_eq!(data_url_base64("data:application/octet-stream;base64,AAAA"), Some("AAAA"));
+        assert_eq!(data_url_base64("https://x/y.png"), None);
+    }
+
+    #[test]
+    fn maps_skills_and_toolsets() {
+        let local = json!([
+            { "name": "arxiv", "description": "Search papers", "category": "research", "enabled": true, "usage": 3, "provenance": "bundled" },
+            { "name": "my-notes", "description": "", "category": null, "enabled": false, "usage": 0, "provenance": "agent" },
+        ]);
+        let skills = skills_from_local(&local);
+        assert_eq!(skills[0], json!({ "name": "arxiv", "skillKey": "arxiv", "description": "Search papers", "category": "research",
+            "source": "bundled", "eligible": true, "disabled": false, "usage": 3 }));
+        assert_eq!(skills[1], json!({ "name": "my-notes", "skillKey": "my-notes", "source": "agent", "eligible": false, "disabled": true, "usage": 0 }));
+
+        let api = json!({ "object": "list", "data": [{ "name": "arxiv", "description": "Search papers", "category": "research" }] });
+        assert_eq!(skills_from_api(&api), vec![json!({ "name": "arxiv", "skillKey": "arxiv", "description": "Search papers",
+            "category": "research", "source": "research", "eligible": true, "disabled": false })]);
+
+        let local_sets = json!([
+            { "name": "web", "label": "Web Search", "description": "Search the web", "platform": "cli", "enabled": true,
+              "available": true, "configured": false, "tools": ["web_extract", "web_search"] },
+            { "name": "browser", "label": "", "description": "", "platform": "cli", "enabled": false, "configured": true, "tools": [] },
+        ]);
+        let groups = tool_groups(&local_sets);
+        assert_eq!(groups[0], json!({ "id": "web", "label": "Web Search", "description": "Search the web", "source": "toolset",
+            "enabled": true, "configured": false, "tools": [{ "id": "web_extract", "label": "web_extract" }, { "id": "web_search", "label": "web_search" }] }));
+        assert_eq!(groups[1], json!({ "id": "browser", "label": "browser", "source": "toolset", "enabled": false, "configured": true, "tools": [] }));
+        let api_sets = json!({ "object": "list", "platform": "api_server", "data": [{ "name": "web", "label": "Web", "enabled": true, "tools": ["web_search"] }] });
+        assert_eq!(tool_groups(&api_sets)[0]["tools"], json!([{ "id": "web_search", "label": "web_search" }]));
+    }
+
+    #[test]
+    fn maps_plugins() {
+        let manage = json!({ "plugins": [
+            { "name": "honcho", "key": "memory/honcho", "version": "1.2.0", "description": "Memory", "source": "bundled", "status": "enabled",
+              "install_dir": "/Users/me/.hermes/plugins/honcho", "settings_schema": [] },
+            { "name": "spotify", "key": "spotify", "version": "", "description": "", "source": "user", "status": "not enabled" },
+        ], "user_count": 1, "bundled_count": 1 });
+        assert_eq!(plugins_out(&manage), vec![
+            json!({ "id": "memory/honcho", "name": "honcho", "version": "1.2.0", "description": "Memory", "enabled": true, "state": "enabled" }),
+            json!({ "id": "spotify", "name": "spotify", "enabled": false, "state": "disabled" }),
+        ]);
+        let legacy = json!({ "plugins": [{ "name": "disk-cleanup", "version": "?", "enabled": true }] });
+        assert_eq!(plugins_out(&legacy), vec![json!({ "id": "disk-cleanup", "name": "disk-cleanup", "enabled": true, "state": "enabled" })]);
+    }
+
+    #[test]
+    fn maps_mcp_servers_without_secrets() {
+        let config = json!({ "servers": [
+            { "name": "github", "transport": "stdio", "url": null, "command": "/Users/me/.local/bin/github-mcp-server",
+              "args": ["--token", "ghp_secret"], "env": { "GITHUB_TOKEN": "ghp_***" }, "auth": null, "enabled": true,
+              "tools": ["search_repos"], "source": "config", "plugin": null },
+            { "name": "zapier", "transport": "http", "url": "https://user:pw@actions.zapier.com/mcp/sk-ak-1234567890abcdef/sse?api_key=xyz#frag",
+              "command": null, "args": [], "env": {}, "auth": "header", "enabled": false, "tools": null, "source": "config" },
+            { "name": "inline", "transport": "stdio", "command": "API_KEY=abc node", "args": [], "env": [], "enabled": true, "source": "plugin", "plugin": "p" },
+        ]});
+        let status = json!({ "servers": [
+            { "name": "github", "transport": "stdio", "tools": 12, "connected": true, "disabled": false, "status": "connected", "source": "config" },
+            { "name": "zapier", "transport": "http", "tools": 0, "connected": false, "disabled": true, "status": "disabled", "source": "config" },
+        ], "checked_at": 1 });
+        let out = mcp_servers_out(&config, Some(&status));
+        assert_eq!(out[0], json!({ "name": "github", "transport": "stdio", "command": "github-mcp-server", "enabled": true, "tools": 12,
+            "status": "connected", "connected": true, "source": "config" }));
+        assert_eq!(out[1], json!({ "name": "zapier", "transport": "http", "url": "https://actions.zapier.com/mcp/…/sse", "enabled": false,
+            "status": "disabled", "connected": false, "source": "config" }));
+        assert_eq!(out[2], json!({ "name": "inline", "transport": "stdio", "enabled": true, "source": "plugin" }));
+        let flat = serde_json::to_string(&out).unwrap();
+        for secret in ["ghp_", "GITHUB_TOKEN", "--token", "user:pw", "api_key", "sk-ak", "abc", "header", "/Users/me"] {
+            assert!(!flat.contains(secret), "leaked {secret}");
+        }
+
+        let no_status = mcp_servers_out(&config, None);
+        assert_eq!(no_status[0]["tools"], json!(["search_repos"]));
+        assert!(no_status[0].get("status").is_none());
+        assert_eq!(safe_url("http://localhost:3000/mcp").as_deref(), Some("http://localhost:3000/mcp"));
+        assert_eq!(program_name("C:\\Tools\\mcp.exe").as_deref(), Some("mcp.exe"));
+        assert_eq!(program_name("npx").as_deref(), Some("npx"));
     }
 }

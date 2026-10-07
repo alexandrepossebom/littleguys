@@ -365,7 +365,7 @@ function RoutineEditor({ guy, job, onClose, onSaved }: { guy: Guy; job: Job | nu
           </Field>
           <Field label="Where do results go?">
             <select className={inputClass} value={target} onChange={(e) => setTarget(e.target.value)}>
-              <option value="">A new thread each run (under Routine runs)</option>
+              <option value="">A new thread each run (listed under Recent runs)</option>
               {threads.map((t) => (
                 <option key={t.key} value={t.key}>
                   Post into “{t.title}”

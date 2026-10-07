@@ -1,16 +1,17 @@
-import { Archive, ArrowDown, RotateCw } from "lucide-react";
+import { ArrowDown, Globe, RotateCw } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { sessions as sessionsApi } from "../lib/gateway";
-import { capsOf, channelName, guyName, isRunning, sessionRow, threadKind, threadTitle } from "../lib/guys";
+import { channelName, gatewayOf, guyName, isRunning, phaseLabel, sessionRow, threadKind, threadTitle } from "../lib/guys";
 import { core } from "../lib/ipc";
-import type { Guy, SessionRow } from "../lib/types";
-import { mainSessionKey, useApp } from "../stores/app";
+import { presentTense, toolKind } from "../lib/toolPhrases";
+import type { Guy } from "../lib/types";
+import { useApp } from "../stores/app";
 import { threadId, useChat } from "../stores/chat";
 import { Avatar, GuyMark } from "../ui/Avatar";
 import { Button, IconButton, Spinner } from "../ui/kit";
 import { Approvals } from "./Approvals";
 import { Composer } from "./Composer";
-import { toItems, Transcript } from "./Transcript";
+import { phaseLabel as livePhaseLabel, toItems, Transcript } from "./Transcript";
 
 export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) {
   const agent = guy;
@@ -62,19 +63,31 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
 
   const kind = threadKind(sessionKey);
   const title = row ? threadTitle(row) : kind === "main" ? "Main chat" : "Chat";
+  // The tool call in flight, if any: drives the header's status line and the browser button.
+  const activeTool = useMemo(() => {
+    if (!running) return null;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      if (it.kind === "tool" && !it.result && thread?.toolStatus[it.call.id] === "running") return it.call;
+    }
+    return null;
+  }, [items, running, thread?.toolStatus]);
+  const browsing = Boolean(activeTool && toolKind(activeTool.name) === "browse");
+  const activity = activeTool
+    ? presentTense(activeTool)
+    : live
+      ? live.text
+        ? "typing"
+        : live.phase
+          ? livePhaseLabel(live.phase).replace(/…$/, "")
+          : "thinking"
+      : running
+        ? "working"
+        : null;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <ChatHeader
-        title={title}
-        row={row}
-        gatewayId={gw}
-        agentId={guy.id}
-        threadKey={tid}
-        sessionKey={sessionKey}
-        agentName={guyName(agent)}
-        running={running}
-      />
+      <ChatHeader guy={guy} title={title} threadKey={tid} sessionKey={sessionKey} activity={activity} browsing={browsing} />
       <div
         ref={scrollRef}
         onScroll={(e) => {
@@ -101,11 +114,15 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
         {thread?.loaded && items.length === 0 && !live && (
           <div className="flex h-full flex-col items-center justify-center pb-10 text-center">
             <Avatar agent={agent} size={72} ring="idle" />
-            <p className="mt-3 font-display text-[15px] font-semibold">Say hi to {guyName(agent)}</p>
+            <p className="mt-3 font-display text-[15px] font-semibold">
+              {kind === "routine" ? "Nothing from this run yet" : `Say hi to ${guyName(agent)}`}
+            </p>
             <p className="mt-1 max-w-xs text-[12.5px] text-[var(--color-ink-3)]">
               {kind === "main"
                 ? "This is your main chat. Ask for anything — research, errands on the web, files, reminders."
-                : "A fresh thread. Good for keeping one topic in one place."}
+                : kind === "routine"
+                  ? `${guyName(agent)}'s messages for this run show up here as they work.`
+                  : "A fresh thread. Good for keeping one topic in one place."}
             </p>
           </div>
         )}
@@ -148,57 +165,66 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
   );
 }
 
+/** Who you're talking to and what they're up to, like a messaging app's header. */
 function ChatHeader({
+  guy,
   title,
-  row,
-  gatewayId,
-  agentId,
   threadKey,
   sessionKey,
-  agentName,
-  running,
+  activity,
+  browsing,
 }: {
+  guy: Guy;
   title: string;
-  row?: SessionRow;
-  gatewayId: string;
-  agentId: string;
   threadKey: string;
   sessionKey: string;
-  agentName: string;
-  running: boolean;
+  activity: string | null;
+  browsing: boolean;
 }) {
   const kind = threadKind(sessionKey);
-  const canArchive = useApp((s) => capsOf(s.roster, gatewayId).threadActions) && kind !== "main" && Boolean(row);
-  const archive = async () => {
-    await sessionsApi.patch(gatewayId, sessionKey, { archived: true }, row?.sessionId ?? undefined).catch(() => {});
-    useApp.getState().selectSession(mainSessionKey(agentId));
-    core.refreshRoster(gatewayId).catch(() => {});
-  };
-  const model = row?.model ? row.model.split("/").pop() : null;
-  const subtitle =
-    kind === "channel"
-      ? `${channelName(sessionKey)} conversation · replies go out as ${agentName}`
-      : kind === "routine"
-        ? "Routine run"
-        : model ?? "";
+  const name = guyName(guy);
+  const gateway = useApp((s) => gatewayOf(s.roster, guy.gatewayId));
+  const hasBrowser = Boolean(gateway?.status.capabilities?.browser);
+  const browserOpen = useApp((s) => Boolean(s.browser.open[guy.uid]));
+  const online = gateway?.status.phase === "connected";
+  const channel = kind === "channel" ? channelName(sessionKey) : null;
+  const channelLabel = channel ? channel.charAt(0).toUpperCase() + channel.slice(1) : null;
+  // The main chat is just "talking to Jefe"; other threads say which one this is.
+  const threadLabel = kind === "main" ? null : kind === "channel" ? `${title} on ${channelLabel}` : title;
+
   return (
-    <div data-tauri-drag-region className="flex h-12 shrink-0 items-center gap-3 border-b border-[var(--color-line)] px-5">
+    <div data-tauri-drag-region className="flex h-14 shrink-0 items-center gap-3 border-b border-[var(--color-line)] px-5">
+      <Avatar agent={guy} size={34} ring={activity ? "working" : "none"} />
       <div data-tauri-drag-region className="min-w-0 flex-1">
-        <h3 className="truncate text-[13.5px] font-semibold">{title}</h3>
-        {subtitle && <p className="truncate text-[11px] text-[var(--color-ink-3)]">{subtitle}</p>}
+        <div data-tauri-drag-region className="flex min-w-0 items-baseline gap-2">
+          <h3 className="shrink-0 font-display text-[14.5px] font-semibold leading-tight">{name}</h3>
+          {threadLabel && <span className="truncate text-[12px] text-[var(--color-ink-3)]">{threadLabel}</span>}
+        </div>
+        <p className="mt-0.5 truncate text-[11.5px] leading-tight">
+          {activity ? (
+            <span className="text-[var(--color-accent-strong)]">{activity}…</span>
+          ) : !online ? (
+            <span className="text-[var(--color-ink-3)]">{phaseLabel(gateway?.status.phase)}</span>
+          ) : channelLabel ? (
+            <span className="text-[var(--color-ink-3)]">
+              Replies go out on {channelLabel} as {name}
+            </span>
+          ) : kind === "routine" ? (
+            <span className="text-[var(--color-ink-3)]">Routine run</span>
+          ) : (
+            <span className="flex items-center gap-1 text-[var(--color-ink-3)]">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-ok)]" /> online
+            </span>
+          )}
+        </p>
       </div>
-      {running && (
-        <span className="flex items-center gap-1.5 rounded-full bg-[var(--color-accent-soft)] px-2.5 py-1 text-[11px] font-medium text-[var(--color-accent-strong)]">
-          <span className="relative flex h-1.5 w-1.5">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--color-accent)] opacity-75" />
-            <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-[var(--color-accent)]" />
-          </span>
-          working
-        </span>
-      )}
-      {canArchive && (
-        <IconButton label="Archive thread" onClick={archive}>
-          <Archive size={13} />
+      {hasBrowser && (
+        <IconButton
+          label={browserOpen ? "Hide browser" : `Show ${name}'s browser`}
+          onClick={() => useApp.getState().setBrowserOpen(guy.uid, !browserOpen)}
+          className={browserOpen ? "bg-[var(--color-chip)] text-[var(--color-ink)]" : browsing ? "animate-pulse text-[var(--color-accent-strong)]" : ""}
+        >
+          <Globe size={13} />
         </IconButton>
       )}
       <IconButton label="Reload thread" onClick={() => useChat.getState().reload(threadKey)}>

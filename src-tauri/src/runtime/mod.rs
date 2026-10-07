@@ -16,6 +16,18 @@
 //! - `exec.approval.list` → `{approvals:[…]}`; `exec.approval.resolve {id, decision: allow-once|allow-always|deny}`
 //! - `cron.list|add|update|remove|run|runs` (if `routines`) — same shapes as OpenClaw
 //! - `models.list` (if `models`), `agents.create|update|delete`, `agents.files.get|set` (if `manage_guys`)
+//! - `agents.workspace.list {agentId, path?, offset?, limit?}` → `{agentId, path, parentPath?, entries:[{path,
+//!   name, kind: file|directory, size?, updatedAtMs?}], totalEntries, offset}` (dirs first, by name; root is `""`)
+//! - `agents.workspace.get {agentId, path}` → `{agentId, file:{path, name, size, updatedAtMs, mimeType,
+//!   encoding: utf8|base64, content}}` (if `files`; text ≤ 256 KB, images ≤ 5 MB)
+//! - `skills.status {agentId}` → `{agentId, skills:[{name, skillKey, description?, source, eligible, disabled,
+//!   filePath?, emoji?, missing?:{bins,env,config,os}}]}`; `skills.read {agentId, name}` → `{name, path?, content}`
+//!   (if `skills`; `source:"command"` marks a slash command)
+//! - `tools.effective {agentId, sessionKey}` / `tools.catalog {agentId}` → `{agentId, groups:[{id, label, source,
+//!   tools:[{id, label, description?}]}], notices?}` (if `tools`)
+//! - `plugins.list` → `{plugins:[{id, name, description?, version?, enabled, state}]}`;
+//!   `mcp.servers.list {agentId?}` → `{servers:[{name, transport, command?, url?, enabled?, status?, tools?}]}`
+//!   (if `plugins`; never env values or secrets)
 //!
 //! Session keys always look like OpenClaw's: `agent:<agentId>:main` (the guy's
 //! main chat), `agent:<agentId>:dashboard:<id>` (threads), `agent:<agentId>:cron:<job>:run:<id>`
@@ -75,6 +87,16 @@ pub struct Capabilities {
     pub attachments: bool,
     /// The model can be picked per guy.
     pub models: bool,
+    /// The guy's workspace can be browsed (`agents.workspace.list|get`).
+    pub files: bool,
+    /// Skills / slash commands can be listed (`skills.status`).
+    pub skills: bool,
+    /// The guy's tools can be listed (`tools.effective` / `tools.catalog`).
+    pub tools: bool,
+    /// Plugins / MCP servers can be listed (`plugins.list`, `mcp.servers.list`).
+    pub plugins: bool,
+    /// The guy's browser can be watched and driven (OpenClaw `browser.request`).
+    pub browser: bool,
 }
 
 impl Capabilities {
@@ -88,6 +110,27 @@ impl Capabilities {
             new_threads: true,
             attachments: true,
             models: true,
+            files: true,
+            skills: true,
+            tools: true,
+            plugins: true,
+            browser: false,
+        }
+    }
+
+    /// OpenClaw's real abilities, from the hello-ok `features.methods` list
+    /// (all of them when an older gateway doesn't send one) and granted scopes.
+    pub fn openclaw_from_hello(hello: &Value, scopes: &[String]) -> Self {
+        let methods: Option<Vec<&str>> = hello["features"]["methods"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
+        let has = |m: &str| methods.as_ref().is_none_or(|list| list.contains(&m));
+        let admin = scopes.iter().any(|s| s == "operator.admin");
+        Self {
+            files: has("agents.workspace.list"),
+            skills: has("skills.status"),
+            tools: has("tools.catalog") || has("tools.effective"),
+            plugins: has("plugins.list"),
+            browser: admin && methods.as_ref().is_some_and(|list| list.contains(&"browser.request")),
+            ..Self::openclaw()
         }
     }
 }

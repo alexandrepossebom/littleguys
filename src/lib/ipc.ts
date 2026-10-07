@@ -55,6 +55,31 @@ export function gwCall<T = unknown>(gateway: string, method: string, params: obj
   return invoke<T>("gw_call", { gateway, method, params, timeoutMs });
 }
 
+/** One message from a guy's live browser stream (see src-tauri/src/browser_stream.rs). */
+export type BrowserStreamMessage =
+  | { kind: "text"; data: { type?: string; targetId?: string; url?: string; title?: string; message?: string; code?: string } }
+  | { kind: "frame"; header: { url?: string; cssWidth: number; cssHeight: number; scrollX?: number; scrollY?: number }; jpeg: Uint8Array }
+  | { kind: "ended"; code: number; reason: string };
+
+export function decodeStreamMessage(buf: ArrayBuffer): BrowserStreamMessage {
+  const bytes = new Uint8Array(buf);
+  const text = (from: number, to?: number) => new TextDecoder().decode(bytes.subarray(from, to));
+  if (bytes[0] === 1) {
+    const len = new DataView(buf, 1, 4).getUint32(0);
+    return { kind: "frame", header: JSON.parse(text(5, 5 + len)), jpeg: bytes.subarray(5 + len) };
+  }
+  const data = JSON.parse(text(1));
+  return bytes[0] === 0 ? { kind: "text", data } : { kind: "ended", code: data.code, reason: data.reason };
+}
+
+export interface BrowserStreamOptions {
+  profile?: string;
+  targetId?: string;
+  maxWidth?: number;
+  maxHeight?: number;
+  quality?: number;
+}
+
 export function errorMessage(err: unknown): string {
   if (typeof err === "string") return err;
   if (err && typeof err === "object" && "message" in err) return String((err as { message: unknown }).message);
@@ -99,6 +124,34 @@ export const core = {
   hidePopover: () => invoke<void>("hide_popover"),
   fitPopover: (height: number) => invoke<void>("fit_popover", { height }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  browser: {
+    /** Relay a guy's browser tab; resolves once streaming, with a `stop()`. */
+    stream: async (gateway: string, options: BrowserStreamOptions, onMessage: (m: BrowserStreamMessage) => void) => {
+      const channel: { onmessage: (buf: ArrayBuffer) => void } = inTauri
+        ? new (await import("@tauri-apps/api/core")).Channel<ArrayBuffer>()
+        : { onmessage: () => {} };
+      channel.onmessage = (buf) => {
+        try {
+          onMessage(decodeStreamMessage(buf));
+        } catch {
+          // a malformed frame; skip it
+        }
+      };
+      const started = await invoke<{ id: number; targetId?: string; url?: string }>("browser_stream_start", {
+        gateway,
+        options,
+        onMessage: channel,
+      });
+      return { ...started, stop: () => invoke<void>("browser_stream_stop", { id: started.id }).catch(() => {}) };
+    },
+    /** A still of a tab, for browsers that can't stream. */
+    screenshot: (gateway: string, profile?: string, targetId?: string) =>
+      invoke<{ src: string; targetId?: string; url?: string }>("browser_screenshot", {
+        gateway,
+        profile: profile ?? null,
+        targetId: targetId ?? null,
+      }),
+  },
   quit: () => invoke<void>("quit"),
   doctor: {
     check: () => invoke<DoctorReport>("doctor_check"),

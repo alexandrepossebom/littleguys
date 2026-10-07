@@ -2433,6 +2433,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "tokio-tungstenite",
+ "toml 1.1.6+spec-1.1.0",
  "uuid",
  "window-vibrancy 0.6.0",
 ]

@@ -13,6 +13,7 @@ import {
   ImageOff,
   Music,
   Search,
+  Send,
   Sparkles,
   Terminal,
   Wrench,
@@ -20,8 +21,9 @@ import {
 } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 import { artifacts } from "../lib/gateway";
-import { gatewayOf, shortTime } from "../lib/guys";
+import { gatewayOf } from "../lib/guys";
 import { errorMessage } from "../lib/ipc";
+import { presentTense, summarizeSteps, type ToolKind, toolKind } from "../lib/toolPhrases";
 import { cleanDirectives, extractMediaLines, type Item, type MediaRef, type ToolCallBlock, type ToolResult } from "../lib/transcript";
 import type { AgentSummary } from "../lib/types";
 export { toItems } from "../lib/transcript";
@@ -33,6 +35,40 @@ import { Markdown } from "../ui/Markdown";
 import { openExternal } from "../ui/openExternal";
 
 // ---- rendering --------------------------------------------------------------
+
+const DAY_MS = 86_400_000;
+
+function dayKey(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+/** "Today", "Yesterday", "Monday", "Mon, Sep 29", "Sep 29, 2025". */
+function dayLabel(ts: number): string {
+  const d = new Date(ts);
+  const startOfToday = new Date().setHours(0, 0, 0, 0);
+  const startOfDay = new Date(ts).setHours(0, 0, 0, 0);
+  const daysAgo = Math.round((startOfToday - startOfDay) / DAY_MS);
+  if (daysAgo === 0) return "Today";
+  if (daysAgo === 1) return "Yesterday";
+  if (daysAgo > 1 && daysAgo < 7) return d.toLocaleDateString(undefined, { weekday: "long" });
+  if (d.getFullYear() === new Date().getFullYear()) return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+/** Sticks to the top of the conversation while its day scrolls past. */
+function DayChip({ label }: { label: string }) {
+  return (
+    <div className="pointer-events-none sticky top-1 z-10 my-3 flex justify-center">
+      <span className="rounded-full bg-[var(--color-pane-solid)]/90 px-3 py-1 text-[11.5px] font-medium text-[var(--color-ink-2)] shadow-[0_1px_4px_rgb(0_0_0/0.08)] ring-1 ring-[var(--color-line)] backdrop-blur">
+        {label}
+      </span>
+    </div>
+  );
+}
+
+type Step = Extract<Item, { kind: "tool" | "thinking" }>;
+type Section = { day: string; label: string; nodes: React.ReactNode[] };
 
 export function Transcript({
   gatewayId,
@@ -49,30 +85,50 @@ export function Transcript({
   live: LiveRun | null;
   toolStatus: Record<string, ToolState>;
 }) {
-  const rendered: React.ReactNode[] = [];
+  const sections: Section[] = [];
   let prevKind: string | null = null;
   let lastTs = 0;
   const where = { gatewayId, sessionKey };
 
-  items.forEach((item) => {
-    const side = item.kind === "user" ? `user:${item.sender ?? ""}` : item.kind === "note" ? null : "guy";
+  // Items are grouped by day so each day's chip can stick while it scrolls by.
+  const sectionFor = (ts: number): Section => {
+    const current = sections[sections.length - 1];
+    if (!ts) {
+      if (current) return current;
+      sections.push({ day: "", label: "", nodes: [] });
+      return sections[0];
+    }
+    const day = dayKey(ts);
+    if (current && (current.day === day || !current.day)) {
+      if (!current.day) Object.assign(current, { day, label: dayLabel(ts) });
+      return current;
+    }
+    sections.push({ day, label: dayLabel(ts), nodes: [] });
+    prevKind = null;
+    return sections[sections.length - 1];
+  };
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const ts = "ts" in item && item.ts ? item.ts : 0;
-    if (ts && lastTs && ts - lastTs > 30 * 60_000) {
-      rendered.push(
+    const section = sectionFor(ts);
+    if (ts && lastTs && ts - lastTs > 30 * 60_000 && dayKey(ts) === dayKey(lastTs)) {
+      section.nodes.push(
         <div key={`ts-${item.id}`} className="py-2 text-center text-[11px] text-[var(--color-ink-3)]">
-          {shortTime(ts)}
+          {new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
         </div>,
       );
       prevKind = null;
     }
     if (ts) lastTs = ts;
+    const side = item.kind === "user" ? `user:${item.sender ?? ""}` : item.kind === "note" ? null : "guy";
     const startsGroup = side !== prevKind;
     prevKind = side;
 
     if (item.kind === "user") {
-      rendered.push(<UserBubble key={item.id} item={item} first={startsGroup} where={where} />);
+      section.nodes.push(<UserBubble key={item.id} item={item} first={startsGroup} where={where} />);
     } else if (item.kind === "note") {
-      rendered.push(
+      section.nodes.push(
         <p
           key={item.id}
           className={`mx-auto my-2 max-w-[80%] text-center text-[11.5px] ${
@@ -82,25 +138,33 @@ export function Transcript({
           {item.text}
         </p>,
       );
+    } else if (item.kind === "tool" || item.kind === "thinking") {
+      // Back-to-back steps fold into one line; the reply stays the focus.
+      const steps: Step[] = [item];
+      while (i + 1 < items.length && (items[i + 1].kind === "tool" || items[i + 1].kind === "thinking")) steps.push(items[++i] as Step);
+      section.nodes.push(
+        <GuyLine key={item.id} agent={agent} showAvatar={startsGroup}>
+          <WorkLog steps={steps} toolStatus={toolStatus} live={Boolean(live)} />
+        </GuyLine>,
+      );
     } else {
-      rendered.push(
+      section.nodes.push(
         <GuyLine key={item.id} agent={agent} showAvatar={startsGroup}>
           {item.kind === "text" && (
             <div className="rounded-2xl rounded-tl-md bg-[var(--color-bubble-them)] px-3.5 py-2">
               <Markdown text={item.text} />
             </div>
           )}
-          {item.kind === "thinking" && <Thinking text={item.text} />}
-          {item.kind === "tool" && <ToolChip call={item.call} result={item.result} status={toolStatus[item.call.id]} />}
           {item.kind === "media" && <MediaView media={item.media} where={where} />}
         </GuyLine>,
       );
     }
-  });
+  }
 
   if (live) {
+    const section = sectionFor(Date.now());
     const startsGroup = prevKind !== "guy";
-    rendered.push(
+    section.nodes.push(
       <GuyLine key="live" agent={agent} showAvatar={startsGroup}>
         {live.text ? (
           <div className="rounded-2xl rounded-tl-md bg-[var(--color-bubble-them)] px-3.5 py-2">
@@ -116,10 +180,19 @@ export function Transcript({
       </GuyLine>,
     );
   }
-  return <>{rendered}</>;
+  return (
+    <>
+      {sections.map((s, i) => (
+        <section key={`${s.day}-${i}`}>
+          {s.label && <DayChip label={s.label} />}
+          {s.nodes}
+        </section>
+      ))}
+    </>
+  );
 }
 
-function phaseLabel(phase: string): string {
+export function phaseLabel(phase: string): string {
   const labels: Record<string, string> = {
     sending: "sending…",
     preparing_workspace: "getting ready…",
@@ -173,20 +246,22 @@ function Thinking({ text }: { text: string }) {
   );
 }
 
-// ---- tool chips ---------------------------------------------------------------
+// ---- tool steps ---------------------------------------------------------------
 
-function toolIcon(name: string) {
-  const n = name.toLowerCase();
-  if (/(browser|web_fetch|fetch|navigate|open_url|web)/.test(n)) return <Globe size={13} />;
-  if (/(search|grep|find|query|glob)/.test(n)) return <Search size={13} />;
-  if (/(exec|bash|shell|command|run|process)/.test(n)) return <Terminal size={13} />;
-  if (/(write|edit|patch|apply|create_file|replace)/.test(n)) return <FilePen size={13} />;
-  if (/(^ls$|list|dir|tree)/.test(n)) return <Folder size={13} />;
-  if (/(read|cat|view|file)/.test(n)) return <FileText size={13} />;
-  if (/(memory|remember|recall)/.test(n)) return <Brain size={13} />;
-  if (/(cron|schedule|automation|routine)/.test(n)) return <Clock size={13} />;
-  return <Wrench size={13} />;
-}
+const KIND_ICON: Record<ToolKind, typeof Globe> = {
+  browse: Globe,
+  fetch: Globe,
+  websearch: Search,
+  search: Search,
+  exec: Terminal,
+  edit: FilePen,
+  read: FileText,
+  list: Folder,
+  memory: Brain,
+  routine: Clock,
+  message: Send,
+  other: Wrench,
+};
 
 function toolSummary(call: ToolCallBlock): string {
   let args = (call.arguments ?? {}) as Record<string, unknown>;
@@ -205,30 +280,84 @@ function toolSummary(call: ToolCallBlock): string {
   return pretty.length > 80 ? `${pretty.slice(0, 77)}…` : pretty;
 }
 
-function ToolChip({ call, result, status }: { call: ToolCallBlock; result?: ToolResult; status?: ToolState }) {
+function stepState(step: Extract<Item, { kind: "tool" }>, toolStatus: Record<string, ToolState>, live: boolean): ToolState {
+  if (step.result) return step.result.isError ? "error" : "completed";
+  // No result and nothing running: the transcript just didn't keep it.
+  return toolStatus[step.call.id] ?? (live ? "running" : "completed");
+}
+
+/** A run of tool calls (and thinking) as one quiet line: "Searched the web and browsed a.com". */
+function WorkLog({ steps, toolStatus, live }: { steps: Step[]; toolStatus: Record<string, ToolState>; live: boolean }) {
   const [open, setOpen] = useState(false);
-  const state: ToolState = result ? (result.isError ? "error" : "completed") : (status ?? "running");
-  const summary = toolSummary(call);
+  const tools = steps.filter((s): s is Extract<Item, { kind: "tool" }> => s.kind === "tool");
+  const states = tools.map((t) => stepState(t, toolStatus, live));
+  const runningIdx = states.lastIndexOf("running");
+  const failed = states.filter((st) => st === "error").length;
+  const lead = runningIdx >= 0 ? tools[runningIdx] : tools[0];
+  const Icon = lead ? KIND_ICON[toolKind(lead.call.name)] : Sparkles;
+  const text =
+    runningIdx >= 0
+      ? `${presentTense(tools[runningIdx].call).replace(/^./, (c) => c.toUpperCase())}…`
+      : tools.length
+        ? summarizeSteps(tools.map((t) => t.call))
+        : "Thought it over";
+
   return (
     <div className="max-w-full">
       <button
         onClick={() => setOpen(!open)}
-        className="group flex max-w-full items-center gap-1.5 rounded-full border border-[var(--color-line)] bg-[var(--color-pane-solid)] py-1 pl-2 pr-2.5 text-[12px] text-[var(--color-ink-2)] transition hover:border-[var(--color-ink-3)]/40"
+        className="group flex max-w-full items-center gap-2 rounded-full py-0.5 pl-0.5 pr-2 text-left text-[12.5px] text-[var(--color-ink-3)] transition-colors hover:bg-[var(--color-chip)] hover:text-[var(--color-ink-2)]"
       >
-        <span className="text-[var(--color-ink-3)]">{toolIcon(call.name)}</span>
-        <span className="font-medium text-[var(--color-ink)]">{call.name}</span>
+        <span
+          className={`flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full ${
+            runningIdx >= 0 ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-strong)]" : "bg-[var(--color-chip)]"
+          }`}
+        >
+          <Icon size={12} />
+        </span>
+        <span className="truncate">{text}</span>
+        {runningIdx >= 0 && <TypingDots className="text-[var(--color-accent)]" />}
+        {failed > 0 && <span className="shrink-0 text-[var(--color-bad)]">{failed === 1 ? "1 step failed" : `${failed} steps failed`}</span>}
+        <ChevronRight size={12} className={`shrink-0 opacity-50 transition-transform ${open ? "rotate-90" : ""}`} />
+      </button>
+      {open && (
+        <div className="ml-[11px] mt-1 space-y-0.5 border-l border-[var(--color-line)] pb-1 pl-3">
+          {steps.map((step) =>
+            step.kind === "thinking" ? (
+              <Thinking key={step.id} text={step.text} />
+            ) : (
+              <ToolStep key={step.id} call={step.call} result={step.result} state={stepState(step, toolStatus, live)} />
+            ),
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolStep({ call, result, state }: { call: ToolCallBlock; result?: ToolResult; state: ToolState }) {
+  const [open, setOpen] = useState(false);
+  const summary = toolSummary(call);
+  const Icon = KIND_ICON[toolKind(call.name)];
+  return (
+    <div className="max-w-full">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex max-w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[12px] text-[var(--color-ink-2)] hover:bg-[var(--color-chip)]"
+      >
+        <Icon size={12} className="shrink-0 text-[var(--color-ink-3)]" />
+        <span className="shrink-0 font-medium text-[var(--color-ink)]">{call.name}</span>
         {summary && <span className="truncate font-mono text-[11px] text-[var(--color-ink-3)]">{summary}</span>}
         {state === "running" ? (
           <TypingDots className="ml-0.5 text-[var(--color-accent)]" />
         ) : state === "error" ? (
-          <X size={12} className="text-[var(--color-bad)]" />
+          <X size={12} className="shrink-0 text-[var(--color-bad)]" />
         ) : (
-          <Check size={12} className="text-[var(--color-ok)]" />
+          <Check size={12} className="shrink-0 text-[var(--color-ok)]" />
         )}
-        <ChevronRight size={12} className={`opacity-40 transition ${open ? "rotate-90" : ""}`} />
       </button>
       {open && (
-        <div className="selectable mt-1.5 overflow-hidden rounded-lg border border-[var(--color-line)] text-[11.5px]">
+        <div className="selectable mb-1 ml-1 mt-1 overflow-hidden rounded-lg border border-[var(--color-line)] text-[11.5px]">
           <pre className="max-h-40 overflow-auto bg-[var(--color-chip)] p-2.5 font-mono text-[var(--color-ink-2)]">
             {typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {}, null, 2)}
           </pre>

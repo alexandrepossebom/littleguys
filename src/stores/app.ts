@@ -1,11 +1,12 @@
 import { useMemo } from "react";
 import { create } from "zustand";
-import { allGuys, findGuy, guyName, guyUid, liveGateways } from "../lib/guys";
+import { allGuys, findGuy, guyName, guyUid, liveGateways, threadKind } from "../lib/guys";
 import { core, listen } from "../lib/ipc";
 import type { ConnStatus, Guy, Navigate, Roster } from "../lib/types";
 
 const ORDER_KEY = "littleguys.order";
 const LAST_THREAD_KEY = "littleguys.lastThread";
+const BROWSER_KEY = "littleguys.browser";
 
 function readJson<T>(key: string, fallback: T): T {
   try {
@@ -16,7 +17,13 @@ function readJson<T>(key: string, fallback: T): T {
   }
 }
 
-export type MainView = "chat" | "routines";
+export type MainView = "chat" | "routines" | "files" | "skills";
+
+/** The browser panel beside the chat: open per guy, one shared width. */
+interface BrowserPanelPrefs {
+  open: Record<string, boolean>;
+  width: number;
+}
 
 interface AppState {
   roster: Roster;
@@ -27,6 +34,13 @@ interface AppState {
   selectedSessionKey: string | null;
   lastThreadByGuy: Record<string, string>;
   view: MainView;
+  /** Open file in the Files tab, per guy (workspace-relative path). */
+  fileByGuy: Record<string, string>;
+  /** Routine run open in the Routines tab, per guy (null = the routines list). */
+  routineRunByGuy: Record<string, string | null>;
+  /** Selected item in the Skills tab, per guy (see lib/abilities.ts ids). */
+  abilityByGuy: Record<string, string>;
+  browser: BrowserPanelPrefs;
   editor: { open: boolean; uid: string | null };
   settingsOpen: boolean;
   addGatewayOpen: boolean;
@@ -35,6 +49,12 @@ interface AppState {
   selectGuy(uid: string, sessionKey?: string | null): void;
   selectSession(key: string | null): void;
   setView(view: MainView): void;
+  selectFile(path: string): void;
+  /** Open a routine run's transcript in the Routines tab (null = back to the list). */
+  selectRoutineRun(key: string | null): void;
+  selectAbility(id: string): void;
+  setBrowserOpen(uid: string, open: boolean): void;
+  setBrowserWidth(width: number): void;
   setOrder(order: string[]): void;
   openEditor(uid: string | null): void;
   closeEditor(): void;
@@ -54,6 +74,10 @@ export const useApp = create<AppState>((set, get) => ({
   selectedSessionKey: null,
   lastThreadByGuy: readJson<Record<string, string>>(LAST_THREAD_KEY, {}),
   view: "chat",
+  fileByGuy: {},
+  routineRunByGuy: {},
+  abilityByGuy: {},
+  browser: readJson<BrowserPanelPrefs>(BROWSER_KEY, { open: {}, width: 520 }),
   editor: { open: false, uid: null },
   settingsOpen: false,
   addGatewayOpen: false,
@@ -74,13 +98,16 @@ export const useApp = create<AppState>((set, get) => ({
     }
   },
   selectGuy: (uid, sessionKey) => {
-    const remembered = get().lastThreadByGuy[uid];
+    // Routine runs live in the Routines tab, not in the chats.
+    const last = get().lastThreadByGuy[uid];
+    const remembered = last && threadKind(last) !== "routine" ? last : undefined;
     const agentId = uid.slice(uid.indexOf("/") + 1);
     const key = sessionKey ?? remembered ?? mainSessionKey(agentId);
     set({ selectedUid: uid, selectedSessionKey: key });
     get().selectSession(key);
   },
   selectSession: (key) => {
+    if (key && threadKind(key) === "routine") return get().selectRoutineRun(key);
     const uid = get().selectedUid;
     if (key && uid) {
       const lastThreadByGuy = { ...get().lastThreadByGuy, [uid]: key };
@@ -90,6 +117,28 @@ export const useApp = create<AppState>((set, get) => ({
     set({ selectedSessionKey: key, view: "chat" });
   },
   setView: (view) => set({ view }),
+  selectRoutineRun: (key) => {
+    const uid = get().selectedUid;
+    if (uid) set({ routineRunByGuy: { ...get().routineRunByGuy, [uid]: key }, view: "routines" });
+  },
+  selectFile: (path) => {
+    const uid = get().selectedUid;
+    if (uid) set({ fileByGuy: { ...get().fileByGuy, [uid]: path }, view: "files" });
+  },
+  selectAbility: (id) => {
+    const uid = get().selectedUid;
+    if (uid) set({ abilityByGuy: { ...get().abilityByGuy, [uid]: id }, view: "skills" });
+  },
+  setBrowserOpen: (uid, open) => {
+    const browser = { ...get().browser, open: { ...get().browser.open, [uid]: open } };
+    localStorage.setItem(BROWSER_KEY, JSON.stringify(browser));
+    set({ browser });
+  },
+  setBrowserWidth: (width) => {
+    const browser = { ...get().browser, width: Math.round(width) };
+    localStorage.setItem(BROWSER_KEY, JSON.stringify(browser));
+    set({ browser });
+  },
   setOrder: (order) => {
     localStorage.setItem(ORDER_KEY, JSON.stringify(order));
     set({ order });
@@ -108,7 +157,7 @@ export const useApp = create<AppState>((set, get) => ({
     if (nav.view === "add-gateway") return set({ addGatewayOpen: true });
     const agentId = nav.agentId ?? (nav.sessionKey ? agentIdFromKey(nav.sessionKey) : null);
     if (nav.gatewayId && agentId) get().selectGuy(guyUid(nav.gatewayId, agentId), nav.sessionKey ?? undefined);
-    if (nav.view === "routines") set({ view: "routines" });
+    if (nav.view === "routines" || nav.view === "files" || nav.view === "skills") set({ view: nav.view });
   },
 }));
 

@@ -1,9 +1,11 @@
 mod activity;
+mod browser_stream;
 mod commands;
 mod doctor;
 pub mod gateway;
 pub mod gateways;
 mod hub;
+pub mod localfs;
 pub mod openclaw;
 pub mod runtime;
 mod tray;
@@ -64,6 +66,9 @@ pub fn run() {
             commands::hide_popover,
             commands::fit_popover,
             commands::reveal_path,
+            browser_stream::browser_stream_start,
+            browser_stream::browser_stream_stop,
+            browser_stream::browser_screenshot,
             commands::quit,
             doctor::doctor_check,
             doctor::doctor_install_openclaw,
@@ -118,6 +123,7 @@ pub fn run() {
             hub.start();
             app.manage(hub);
             app.manage(activity);
+            app.manage(std::sync::Arc::new(browser_stream::Streams::default()));
 
             if let Err(e) = app.global_shortcut().register(open_shortcut) {
                 log::warn!("could not register ⌘⇧L: {e}");

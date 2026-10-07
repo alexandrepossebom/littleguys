@@ -34,6 +34,11 @@ export interface Capabilities {
   newThreads: boolean;
   attachments: boolean;
   models: boolean;
+  files: boolean;
+  skills: boolean;
+  tools: boolean;
+  plugins: boolean;
+  browser: boolean;
 }
 
 export interface ConnStatus {
@@ -230,4 +235,110 @@ export interface DoctorReport {
   connected: boolean;
   issues: DoctorIssue[];
   logTail: string | null;
+}
+
+// ---- per-guy workspace, skills & tools, browser (see src-tauri/src/runtime/mod.rs) ----
+
+export interface WorkspaceEntry {
+  /** Workspace-relative, `/`-separated. */
+  path: string;
+  name: string;
+  kind: "file" | "directory";
+  size?: number;
+  updatedAtMs?: number;
+}
+
+export interface WorkspaceListing {
+  agentId: string;
+  /** "" is the workspace root. */
+  path: string;
+  parentPath?: string;
+  entries: WorkspaceEntry[];
+  totalEntries: number;
+  offset: number;
+}
+
+export interface WorkspaceFile {
+  path: string;
+  name: string;
+  size: number;
+  updatedAtMs?: number;
+  mimeType: string;
+  encoding: "utf8" | "base64";
+  content: string;
+  truncated?: boolean;
+}
+
+export interface SkillEntry {
+  name: string;
+  skillKey?: string;
+  description?: string;
+  /** Where it comes from (bundled, workspace, personal…); `command` marks a slash command. */
+  source?: string;
+  category?: string;
+  emoji?: string;
+  eligible?: boolean;
+  disabled?: boolean;
+  blockedByAllowlist?: boolean;
+  blockedByAgentFilter?: boolean;
+  always?: boolean;
+  filePath?: string;
+  homepage?: string;
+  hint?: string;
+  /** Hermes: how many times it was used. */
+  usage?: number | string;
+  primaryEnv?: string;
+  missing?: Record<string, string[] | undefined>;
+  install?: Array<{ id: string; kind: string; label: string; bins?: string[] }>;
+}
+
+export interface ToolEntry {
+  id: string;
+  label?: string;
+  description?: string;
+  source?: string;
+  pluginId?: string;
+  mcpServer?: string;
+  risk?: string;
+  deniedBySession?: boolean;
+}
+
+export interface ToolGroup {
+  id: string;
+  label?: string;
+  description?: string;
+  source?: string;
+  pluginId?: string;
+  enabled?: boolean;
+  tools: ToolEntry[];
+}
+
+export interface PluginEntry {
+  id: string;
+  name: string;
+  description?: string;
+  version?: string;
+  enabled?: boolean;
+  installed?: boolean;
+  state?: string;
+  error?: string;
+  kind?: string[];
+}
+
+export interface McpServer {
+  name: string;
+  transport?: string;
+  command?: string;
+  url?: string;
+  enabled?: boolean;
+  status?: string;
+  tools?: number | string[];
+  source?: string;
+}
+
+export interface BrowserTab {
+  targetId: string;
+  title?: string;
+  url?: string;
+  type?: string;
 }

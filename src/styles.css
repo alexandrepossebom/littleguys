@@ -116,3 +116,33 @@ button { cursor: default; }
 .hljs-comment { color: #8a817c; font-style: italic; }
 .hljs-title, .hljs-section { color: #8cc8ff; }
 .hljs-variable, .hljs-params { color: #f3f0ee; }
+
+/* Per-guy theming: set `--guy-h` (their avatar hue) on a container. */
+.guy-themed {
+  --guy-wash: hsl(var(--guy-h) 85% 96.5%);
+  --guy-wash-strong: hsl(var(--guy-h) 80% 91%);
+  --guy-ink: hsl(var(--guy-h) 50% 36%);
+}
+@media (prefers-color-scheme: dark) {
+  .guy-themed {
+    --guy-wash: hsl(var(--guy-h) 22% 16%);
+    --guy-wash-strong: hsl(var(--guy-h) 28% 23%);
+    --guy-ink: hsl(var(--guy-h) 75% 78%);
+  }
+}
+
+/* Long-form reading (workspace files, skill instructions). */
+.prose-doc { font-size: 14px; line-height: 1.65; }
+.prose-doc h1, .prose-doc h2, .prose-doc h3 { font-family: var(--font-display); letter-spacing: -0.01em; }
+.prose-doc h1 { font-size: 1.5em; margin: 0 0 0.6em; }
+.prose-doc h2 { font-size: 1.18em; margin: 1.4em 0 0.4em; }
+.prose-doc h3 { font-size: 1.04em; margin: 1.2em 0 0.3em; }
+.prose-doc p, .prose-doc ul, .prose-doc ol { margin: 0.55em 0; }
+.prose-doc pre { border-radius: 8px; }
+
+/* Source view: gutter + code, no wrapping. */
+.code-view { background: #201c1a; color: #f3f0ee; }
+.code-view pre { margin: 0; background: none; padding: 0; border-radius: 0; font-size: 12.5px; line-height: 1.6; overflow: visible; }
+.code-view .gutter { color: rgb(243 240 238 / 0.28); text-align: right; user-select: none; }
+.code-view code { font-size: inherit !important; }
+.code-view .gutter { font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6; }

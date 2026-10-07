@@ -34,6 +34,11 @@ export const FULL_CAPS: Capabilities = {
   newThreads: true,
   attachments: true,
   models: true,
+  files: false,
+  skills: false,
+  tools: false,
+  plugins: false,
+  browser: false,
 };
 
 /** Is this runtime on this Mac (so its folders can be opened in Finder)? */
