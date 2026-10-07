@@ -124,6 +124,12 @@ export const core = {
   hidePopover: () => invoke<void>("hide_popover"),
   fitPopover: (height: number) => invoke<void>("fit_popover", { height }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  /** A file a guy referenced by path (`MEDIA:/…`), as a short-lived URL the webview can load. */
+  media: (gateway: string, source: string, sessionKey?: string, agentId?: string) =>
+    invoke<{ available: boolean; url?: string; mimeType?: string; sizeBytes?: number; expiresAt?: string; code?: string; reason?: string }>(
+      "gw_media",
+      { gateway, source, sessionKey: sessionKey ?? null, agentId: agentId ?? null },
+    ),
   browser: {
     /** Relay a guy's browser tab; resolves once streaming, with a `stop()`. */
     stream: async (gateway: string, options: BrowserStreamOptions, onMessage: (m: BrowserStreamMessage) => void) => {

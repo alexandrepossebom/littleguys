@@ -195,12 +195,9 @@ pub async fn browser_screenshot(
         .call("browser.request", json!({ "method": "POST", "path": "/screenshot", "query": query, "body": body }))
         .await?;
     let path = shot["path"].as_str().ok_or_else(|| RpcError::new("BAD_RESPONSE", "the gateway didn't return a screenshot"))?;
-    let gateway_url = client.status().url.unwrap_or_default();
-    let origin = screencast_url(&gateway_url, "/")
-        .map(|u| u.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1))
-        .ok_or_else(|| RpcError::new("BAD_RESPONSE", "unknown gateway address"))?;
+    let origin = client.http_origin().ok_or_else(|| RpcError::new("BAD_RESPONSE", "unknown gateway address"))?;
     let mut req = reqwest::Client::new()
-        .get(format!("{}__openclaw__/assistant-media", origin))
+        .get(format!("{origin}/__openclaw__/assistant-media"))
         .query(&[("source", path)])
         .timeout(Duration::from_secs(15));
     if let Some(token) = client.http_bearer() {

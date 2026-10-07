@@ -52,6 +52,9 @@ pub struct Roster {
 struct GatewayState {
     roster: GatewayRoster,
     running: HashSet<String>,
+    /// Sessions working because a routine started them (not you): they don't
+    /// make the menu-bar guy look busy.
+    automated: HashSet<String>,
     approvals: HashMap<String, Value>,
     refresh_scheduled: bool,
 }
@@ -268,6 +271,7 @@ impl Activity {
                                 }
                                 Some("end") | Some("error") => {
                                     notify = g.running.remove(key) && !focused;
+                                    g.automated.remove(key);
                                 }
                                 _ => {}
                             }
@@ -315,7 +319,22 @@ impl Activity {
                 self.publish();
             }
             "cron" => {
-                if payload.get("action").and_then(Value::as_str) == Some("finished") {
+                let action = payload.get("action").and_then(Value::as_str);
+                if let Some(key) = routine_target(payload) {
+                    let mut state = self.state.lock().unwrap();
+                    if let Some(g) = state.gateway(gateway) {
+                        match action {
+                            Some("started") => {
+                                g.automated.insert(key);
+                            }
+                            Some("finished") => {
+                                g.automated.remove(&key);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if action == Some("finished") {
                     self.notify_routine(gateway, payload);
                 }
                 self.schedule_refresh(gateway);
@@ -420,10 +439,12 @@ impl Activity {
     fn publish(&self) {
         let roster = self.snapshot();
         let _ = self.app.emit("lg:roster", &roster);
-        self.update_mood(&roster);
+        let automated: HashMap<String, HashSet<String>> =
+            self.state.lock().unwrap().gateways.iter().map(|g| (g.roster.id.clone(), g.automated.clone())).collect();
+        self.update_mood(&roster, &automated);
     }
 
-    fn update_mood(&self, roster: &Roster) {
+    fn update_mood(&self, roster: &Roster, automated: &HashMap<String, HashSet<String>>) {
         let enabled: Vec<&GatewayRoster> = roster.gateways.iter().filter(|g| g.enabled).collect();
         let connected: Vec<&&GatewayRoster> = enabled.iter().filter(|g| g.status.phase == Phase::Connected).collect();
         let shown = |g: &GatewayRoster, key: &str| {
@@ -433,7 +454,11 @@ impl Activity {
             || enabled.iter().any(|g| matches!(g.status.phase, Phase::Pairing | Phase::AuthFailed))
         {
             Mood::NeedsYou
-        } else if connected.iter().any(|g| g.running.iter().any(|k| shown(g, k))) {
+        } else if connected.iter().any(|g| {
+            // Routine runs happen in the background; only work you're waiting on animates.
+            let by_routine = automated.get(&g.id);
+            g.running.iter().any(|k| shown(g, k) && !k.contains(":cron:") && !by_routine.is_some_and(|a| a.contains(k)))
+        }) {
             Mood::Working
         } else if connected.iter().any(|g| {
             g.sessions
@@ -602,6 +627,21 @@ fn notifiable_session(key: &str) -> bool {
     key.ends_with(":main") || key.contains(":dashboard:")
 }
 
+/// The conversation a routine run happens in, when it isn't its own
+/// (`sessionTarget` "session:<key>" or "main"); isolated runs get `:cron:` keys.
+fn routine_target(payload: &Value) -> Option<String> {
+    let job = payload.get("job")?;
+    let target = job.get("sessionTarget").and_then(Value::as_str)?;
+    if let Some(key) = target.strip_prefix("session:") {
+        return Some(key.to_string());
+    }
+    let agent = job
+        .get("agentId")
+        .or_else(|| job.pointer("/owner/agentId"))
+        .and_then(Value::as_str)?;
+    (target == "main").then(|| format!("agent:{agent}:main"))
+}
+
 fn is_notable_unread(row: &Value) -> bool {
     row.get("unread").and_then(Value::as_bool) == Some(true)
         && row.get("key").and_then(Value::as_str).is_some_and(notifiable_session)
@@ -632,6 +672,15 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_the_conversation_a_routine_runs_in() {
+        let job = |target: &str| json!({ "action": "started", "job": { "agentId": "moneynuggs", "sessionTarget": target } });
+        assert_eq!(routine_target(&job("session:agent:moneynuggs:dashboard:abc")).as_deref(), Some("agent:moneynuggs:dashboard:abc"));
+        assert_eq!(routine_target(&job("main")).as_deref(), Some("agent:moneynuggs:main"));
+        assert_eq!(routine_target(&job("isolated")), None);
+        assert_eq!(routine_target(&json!({ "action": "finished", "jobId": "x" })), None);
+    }
 
     #[test]
     fn parses_agent_from_session_key() {

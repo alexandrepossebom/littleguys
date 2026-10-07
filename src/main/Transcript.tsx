@@ -11,6 +11,7 @@ import {
   Folder,
   Globe,
   ImageOff,
+  Maximize2,
   Music,
   Search,
   Send,
@@ -19,17 +20,18 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { artifacts } from "../lib/gateway";
 import { gatewayOf } from "../lib/guys";
-import { errorMessage } from "../lib/ipc";
+import { core, errorMessage } from "../lib/ipc";
 import { presentTense, summarizeSteps, type ToolKind, toolKind } from "../lib/toolPhrases";
 import { cleanDirectives, extractMediaLines, type Item, type MediaRef, type ToolCallBlock, type ToolResult } from "../lib/transcript";
 import type { AgentSummary } from "../lib/types";
 export { toItems } from "../lib/transcript";
-import { useApp } from "../stores/app";
+import { agentIdFromKey, useApp } from "../stores/app";
 import type { LiveRun, ToolState } from "../stores/chat";
 import { Avatar } from "../ui/Avatar";
+import { Lightbox } from "../ui/Lightbox";
 import { TypingDots } from "../ui/kit";
 import { Markdown } from "../ui/Markdown";
 import { openExternal } from "../ui/openExternal";
@@ -421,6 +423,32 @@ async function resolveArtifactUrl(gatewayId: string, sessionKey: string, artifac
   return url;
 }
 
+/** `MEDIA:/path` files served by the gateway itself, cached until their ticket runs out. */
+type PathMedia = Awaited<ReturnType<typeof core.media>>;
+const pathCache = new Map<string, { result: Promise<PathMedia>; until: number }>();
+function pathMedia(gatewayId: string, source: string, sessionKey: string): Promise<PathMedia> {
+  const key = `${gatewayId}|${sessionKey}|${source}`;
+  const hit = pathCache.get(key);
+  if (hit && hit.until > Date.now()) return hit.result;
+  const result = core.media(gatewayId, source, sessionKey, agentIdFromKey(sessionKey) ?? undefined);
+  pathCache.set(key, { result, until: Date.now() + 60_000 });
+  result
+    .then((r) => {
+      const expires = r.expiresAt ? Date.parse(r.expiresAt) - 30_000 : Date.now() + 5 * 60_000;
+      pathCache.set(key, { result, until: r.available ? expires : Date.now() + 60_000 });
+    })
+    .catch(() => pathCache.delete(key));
+  return result;
+}
+
+function kindFromMime(mime: string | undefined, fallback: MediaRef["kind"]): MediaRef["kind"] {
+  if (!mime) return fallback;
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return "file";
+}
+
 function formatSize(bytes?: number): string {
   if (!bytes) return "";
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -438,7 +466,14 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
   });
   const [failed, setFailed] = useState<string | null>(null);
   const [lookedUp, setLookedUp] = useState(false);
-  const inline = media.kind !== "file";
+  // For `MEDIA:/path` files with no stored copy: asking the gateway for the file itself.
+  const [pathState, setPathState] = useState<"idle" | "loading" | "ready" | "gone">("idle");
+  const [served, setServed] = useState<{ mimeType?: string; sizeBytes?: number } | null>(null);
+  const [viewing, setViewing] = useState<{ startAt: number } | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const kind = kindFromMime(served?.mimeType, media.kind);
+  const sizeBytes = served?.sizeBytes ?? media.sizeBytes;
+  const inline = kind !== "file";
 
   // `MEDIA:/path` references: find the stored copy of that file in this thread.
   useEffect(() => {
@@ -455,6 +490,26 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
       cancelled = true;
     };
   }, [media.path, media.fileName, artifactId, where.gatewayId, where.sessionKey]);
+
+  // No stored copy: OpenClaw can serve the file straight from the guy's machine.
+  useEffect(() => {
+    if (!media.path || artifactId || !lookedUp || pathState !== "idle") return;
+    if (gateway?.status.kind !== "openclaw") return setPathState("gone");
+    let cancelled = false;
+    setPathState("loading");
+    pathMedia(where.gatewayId, media.path, where.sessionKey)
+      .then((r) => {
+        if (cancelled) return;
+        if (!r.available || !r.url) return setPathState("gone");
+        setServed({ mimeType: r.mimeType, sizeBytes: r.sizeBytes });
+        setSrc(r.url);
+        setPathState("ready");
+      })
+      .catch(() => !cancelled && setPathState("gone"));
+    return () => {
+      cancelled = true;
+    };
+  }, [media.path, artifactId, lookedUp, pathState, gateway?.status.kind, where.gatewayId, where.sessionKey]);
 
   // Inline media resolves its URL right away; files wait for a click.
   useEffect(() => {
@@ -481,41 +536,51 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
     }
   };
 
-  const name = media.fileName ?? (media.kind === "image" ? "Image" : media.kind === "video" ? "Video" : "File");
-  const onBot = media.path && !artifactId && (lookedUp || !media.path);
+  const name = media.fileName ?? (kind === "image" ? "Image" : kind === "video" ? "Video" : "File");
+  const onBot = media.path && !artifactId && !src && pathState === "gone";
 
   // Not retrievable: a file that only exists on the bot's machine.
-  if (onBot || (!src && !artifactId && !inline)) {
+  if (onBot || (!src && !artifactId && !inline && !media.path)) {
     return (
       <FileCard
-        icon={media.kind}
+        icon={kind}
         name={name}
-        detail={media.path ? `on ${gateway?.name ?? "the bot's computer"}` : formatSize(media.sizeBytes)}
+        detail={media.path ? `on ${gateway?.name ?? "the bot's computer"}` : formatSize(sizeBytes)}
         title={media.path}
       />
     );
   }
 
   if (failed) {
-    return <FileCard icon={media.kind} name={name} detail="couldn't load" title={failed} broken />;
+    return <FileCard icon={kind} name={name} detail="couldn't load" title={failed} broken />;
   }
 
-  if (media.kind === "file") {
-    return <FileCard icon="file" name={name} detail={formatSize(media.sizeBytes)} onOpen={open} />;
+  if (kind === "file") {
+    return <FileCard icon="file" name={name} detail={formatSize(sizeBytes)} onOpen={open} />;
   }
 
   if (!src) {
-    return media.kind === "image" ? (
+    return kind === "image" ? (
       <div className="h-40 w-56 animate-pulse rounded-xl bg-[var(--color-chip)]" />
     ) : (
-      <FileCard icon={media.kind} name={name} detail="loading…" />
+      <FileCard icon={kind} name={name} detail="loading…" />
     );
   }
 
-  if (media.kind === "video") {
+  const expand = () => {
+    const v = videoRef.current;
+    v?.pause();
+    setViewing({ startAt: v?.currentTime ?? 0 });
+  };
+  const viewer = viewing && src && (kind === "image" || kind === "video") && (
+    <Lightbox kind={kind} src={src} name={name} startAt={viewing.startAt} onClose={() => setViewing(null)} />
+  );
+
+  if (kind === "video") {
     return (
-      <div className="max-w-[440px]">
+      <div className="group/video relative max-w-[440px]">
         <video
+          ref={videoRef}
           src={src}
           controls
           preload="metadata"
@@ -523,37 +588,49 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
           onError={() => setFailed("This video couldn't be played here.")}
           className="max-h-80 w-full rounded-xl border border-[var(--color-line)] bg-black"
         />
-        <FileCaption name={name} size={media.sizeBytes} onOpen={open} />
+        <button
+          onClick={expand}
+          title="View larger"
+          aria-label="View larger"
+          className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full bg-black/55 text-white opacity-0 backdrop-blur transition group-hover/video:opacity-100 focus-visible:opacity-100"
+        >
+          <Maximize2 size={13} />
+        </button>
+        <FileCaption name={name} size={sizeBytes} onOpen={expand} label="View" />
+        {viewer}
       </div>
     );
   }
-  if (media.kind === "audio") {
+  if (kind === "audio") {
     return (
       <div className="w-[320px]">
         <audio src={src} controls preload="metadata" onError={() => setFailed("This audio couldn't be played here.")} className="w-full" />
-        <FileCaption name={name} size={media.sizeBytes} onOpen={open} />
+        <FileCaption name={name} size={sizeBytes} onOpen={open} />
       </div>
     );
   }
   return (
-    <button onClick={open} className="block" title={`Open ${name}`}>
-      <img
-        src={src}
-        alt={name}
-        onError={() => setFailed("This image couldn't be loaded.")}
-        className="max-h-80 max-w-[360px] rounded-xl border border-[var(--color-line)] object-contain"
-      />
-    </button>
+    <>
+      <button onClick={() => setViewing({ startAt: 0 })} className="block cursor-zoom-in" title={`View ${name}`}>
+        <img
+          src={src}
+          alt={name}
+          onError={() => setFailed("This image couldn't be loaded.")}
+          className="max-h-80 max-w-[360px] rounded-xl border border-[var(--color-line)] object-contain"
+        />
+      </button>
+      {viewer}
+    </>
   );
 }
 
-function FileCaption({ name, size, onOpen }: { name: string; size?: number; onOpen: () => void }) {
+function FileCaption({ name, size, onOpen, label = "Open" }: { name: string; size?: number; onOpen: () => void; label?: string }) {
   return (
     <div className="mt-1 flex items-center gap-1.5 px-1 text-[11px] text-[var(--color-ink-3)]">
       <span className="truncate">{name}</span>
       {size ? <span>· {formatSize(size)}</span> : null}
-      <button onClick={onOpen} className="ml-auto flex items-center gap-0.5 hover:text-[var(--color-ink)]" title="Open">
-        <Download size={11} /> Open
+      <button onClick={onOpen} className="ml-auto flex items-center gap-0.5 hover:text-[var(--color-ink)]" title={label}>
+        {label === "Open" ? <Download size={11} /> : <Maximize2 size={11} />} {label}
       </button>
     </div>
   );

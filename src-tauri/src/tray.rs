@@ -51,9 +51,10 @@ const FRAMES: &[(&str, &[u8])] = &[
 fn schedule(mood: Mood) -> &'static [(&'static str, u64)] {
     match mood {
         Mood::Idle => &[("idle-0", 3600), ("idle-1", 140), ("idle-0", 2400), ("idle-2", 900), ("idle-0", 1800), ("idle-1", 130)],
-        Mood::Working => &[("work-0", 130), ("work-1", 130), ("work-2", 130), ("work-3", 130)],
-        Mood::News => &[("news-0", 360), ("news-1", 360), ("news-0", 360), ("news-1", 360), ("idle-0", 1600)],
-        Mood::NeedsYou => &[("needs-0", 280), ("needs-1", 280)],
+        // Calm on purpose: a busy guy can work for hours.
+        Mood::Working => &[("work-0", 380), ("work-1", 380), ("work-2", 380), ("work-3", 380), ("work-0", 1400)],
+        Mood::News => &[("news-0", 5000), ("news-1", 260), ("news-0", 260), ("news-1", 260)],
+        Mood::NeedsYou => &[("needs-0", 520), ("needs-1", 520)],
         Mood::Offline => &[("off-0", 800), ("off-1", 800), ("off-2", 800)],
         Mood::Setup => &[("setup-0", 320), ("setup-1", 320), ("setup-2", 320)],
     }

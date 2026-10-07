@@ -6,6 +6,7 @@ pub mod gateway;
 pub mod gateways;
 mod hub;
 pub mod localfs;
+mod media;
 pub mod openclaw;
 pub mod runtime;
 mod tray;
@@ -69,6 +70,7 @@ pub fn run() {
             browser_stream::browser_stream_start,
             browser_stream::browser_stream_stop,
             browser_stream::browser_screenshot,
+            media::gw_media,
             commands::quit,
             doctor::doctor_check,
             doctor::doctor_install_openclaw,

@@ -246,6 +246,20 @@ impl GatewayClient {
         &self.inner.paths
     }
 
+    /// The gateway's HTTP origin (`https://host` for `wss://host`), for its
+    /// web endpoints.
+    pub fn http_origin(&self) -> Option<String> {
+        let url = self.inner.status.lock().unwrap().url.clone()?;
+        let (scheme, rest) = url.split_once("://")?;
+        let host = rest.split(['/', '?', '#']).next().filter(|h| !h.is_empty())?;
+        let scheme = match scheme {
+            "wss" => "https",
+            "ws" => "http",
+            other => other,
+        };
+        Some(format!("{scheme}://{host}"))
+    }
+
     /// The device token for the current address, for the gateway's HTTP
     /// endpoints (`Authorization: Bearer …`).
     pub fn http_bearer(&self) -> Option<String> {

@@ -122,39 +122,150 @@ for (const [name, svg] of Object.entries(frames)) {
 console.log(`wrote ${Object.keys(frames).length} tray frames to ${path.relative(root, trayDir)}`);
 
 // ---------------------------------------------------------------------------
-// App icon: the guy, in color, on a warm squircle (macOS 1024 grid: 824 plate).
+// App icon: the guy and a friend, chatting, on a warm macOS squircle
+// (1024 canvas, 824 plate, continuous corners).
 
+/**
+ * Apple-style plate: a rounded square with smoothed ("continuous") corners,
+ * straight sides. Corner math after figma-squircle (smoothing 0.6).
+ */
+function squircle(x, y, size, radius = size * 0.2237, smoothing = 0.6) {
+  const rad = (deg) => (deg * Math.PI) / 180;
+  const p = Math.min((1 + smoothing) * radius, size / 2);
+  const arcMeasure = 90 * (1 - smoothing);
+  const arc = Math.sin(rad(arcMeasure / 2)) * radius * Math.sqrt(2);
+  const alpha = (90 - arcMeasure) / 2;
+  const p3p4 = radius * Math.tan(rad(alpha / 2));
+  const beta = 45 * smoothing;
+  const c = p3p4 * Math.cos(rad(beta));
+  const d = c * Math.tan(rad(beta));
+  const b = (p - arc - c - d) / 3;
+  const a = 2 * b;
+  const R = radius;
+  const f = (n) => n.toFixed(3);
+  return [
+    `M ${f(x + size - p)} ${f(y)}`,
+    `c ${f(a)} 0 ${f(a + b)} 0 ${f(a + b + c)} ${f(d)}`,
+    `a ${f(R)} ${f(R)} 0 0 1 ${f(arc)} ${f(arc)}`,
+    `c ${f(d)} ${f(c)} ${f(d)} ${f(b + c)} ${f(d)} ${f(a + b + c)}`,
+    `L ${f(x + size)} ${f(y + size - p)}`,
+    `c 0 ${f(a)} 0 ${f(a + b)} ${f(-d)} ${f(a + b + c)}`,
+    `a ${f(R)} ${f(R)} 0 0 1 ${f(-arc)} ${f(arc)}`,
+    `c ${f(-c)} ${f(d)} ${f(-(b + c))} ${f(d)} ${f(-(a + b + c))} ${f(d)}`,
+    `L ${f(x + p)} ${f(y + size)}`,
+    `c ${f(-a)} 0 ${f(-(a + b))} 0 ${f(-(a + b + c))} ${f(-d)}`,
+    `a ${f(R)} ${f(R)} 0 0 1 ${f(-arc)} ${f(-arc)}`,
+    `c ${f(-d)} ${f(-c)} ${f(-d)} ${f(-(b + c))} ${f(-d)} ${f(-(a + b + c))}`,
+    `L ${f(x)} ${f(y + p)}`,
+    `c 0 ${f(-a)} 0 ${f(-(a + b))} ${f(d)} ${f(-(a + b + c))}`,
+    `a ${f(R)} ${f(R)} 0 0 1 ${f(arc)} ${f(-arc)}`,
+    `c ${f(c)} ${f(-d)} ${f(b + c)} ${f(-d)} ${f(a + b + c)} ${f(-d)}`,
+    "Z",
+  ].join(" ");
+}
+
+/** A little guy at the origin, `r` = head radius; feet hang below. */
+function guyShape(r, fill) {
+  const h = r * 0.82; // straight sides below the dome
+  const k = r * 0.26; // bottom corner radius
+  const foot = { w: r * 0.46, h: r * 0.34, gap: r * 0.16 };
+  return `
+    <path d="M ${-r} 0 A ${r} ${r} 0 0 1 ${r} 0 L ${r} ${h - k} Q ${r} ${h} ${r - k} ${h} L ${-r + k} ${h} Q ${-r} ${h} ${-r} ${h - k} Z" fill="${fill}"/>
+    <rect x="${-foot.gap / 2 - foot.w}" y="${h - foot.h * 0.45}" width="${foot.w}" height="${foot.h}" rx="${foot.h * 0.48}" fill="${fill}"/>
+    <rect x="${foot.gap / 2}" y="${h - foot.h * 0.45}" width="${foot.w}" height="${foot.h}" rx="${foot.h * 0.48}" fill="${fill}"/>`;
+}
+
+function face(r, { look = 0, blush = "#FF7F86", blushOpacity = 0.5 } = {}) {
+  const ex = r * 0.36;
+  const ey = -r * 0.12;
+  const erx = r * 0.15;
+  const ery = r * 0.21;
+  const dx = look * r * 0.06;
+  return `
+    <ellipse cx="${-ex + dx}" cy="${ey}" rx="${erx}" ry="${ery}" fill="url(#eye)"/>
+    <ellipse cx="${ex + dx}" cy="${ey}" rx="${erx}" ry="${ery}" fill="url(#eye)"/>
+    <circle cx="${-ex + dx + erx * 0.35}" cy="${ey - ery * 0.38}" r="${erx * 0.36}" fill="#fff"/>
+    <circle cx="${ex + dx + erx * 0.35}" cy="${ey - ery * 0.38}" r="${erx * 0.36}" fill="#fff"/>
+    <circle cx="${-ex + dx - erx * 0.3}" cy="${ey + ery * 0.42}" r="${erx * 0.14}" fill="#fff" opacity="0.8"/>
+    <circle cx="${ex + dx - erx * 0.3}" cy="${ey + ery * 0.42}" r="${erx * 0.14}" fill="#fff" opacity="0.8"/>
+    <ellipse cx="${-r * 0.66}" cy="${r * 0.2}" rx="${r * 0.15}" ry="${r * 0.09}" fill="${blush}" opacity="${blushOpacity}"/>
+    <ellipse cx="${r * 0.66}" cy="${r * 0.2}" rx="${r * 0.15}" ry="${r * 0.09}" fill="${blush}" opacity="${blushOpacity}"/>
+    <path d="M ${-r * 0.15 + dx} ${r * 0.2} Q ${dx} ${r * 0.34} ${r * 0.15 + dx} ${r * 0.2}" stroke="#3A2318" stroke-width="${r * 0.07}" fill="none" stroke-linecap="round"/>`;
+}
+
+const plate = squircle(100, 100, 824);
 const appIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#FFD27A"/>
-      <stop offset="1" stop-color="#FF8A5B"/>
+    <linearGradient id="bg" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#FFC56E"/>
+      <stop offset="0.55" stop-color="#FF8F4E"/>
+      <stop offset="1" stop-color="#FF5F45"/>
     </linearGradient>
-    <linearGradient id="guy" x1="0" y1="0" x2="0" y2="1">
+    <radialGradient id="sheen" cx="0.3" cy="0.12" r="0.75">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="0.6" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vignette" cx="0.5" cy="1.05" r="0.7">
+      <stop offset="0" stop-color="#C2321A" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#C2321A" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="guy" cx="0.36" cy="0.25" r="0.95">
       <stop offset="0" stop-color="#FFFFFF"/>
-      <stop offset="1" stop-color="#FFF1E6"/>
+      <stop offset="0.6" stop-color="#FFF6F0"/>
+      <stop offset="1" stop-color="#F5D9CB"/>
+    </radialGradient>
+    <radialGradient id="pal" cx="0.36" cy="0.25" r="0.95">
+      <stop offset="0" stop-color="#C9F7E2"/>
+      <stop offset="0.6" stop-color="#8FE3BF"/>
+      <stop offset="1" stop-color="#5BC79F"/>
+    </radialGradient>
+    <linearGradient id="eye" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4A2E22"/>
+      <stop offset="1" stop-color="#21130D"/>
     </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#7A2E0E" flood-opacity="0.28"/>
+    <linearGradient id="bubble" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#FFF1E8"/>
+    </linearGradient>
+    <clipPath id="plateClip"><path d="${plate}"/></clipPath>
+    <filter id="plateShadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000" flood-opacity="0.24"/>
     </filter>
-    <filter id="plate" x="-10%" y="-10%" width="120%" height="125%">
-      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.22"/>
+    <filter id="lift" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="16" stdDeviation="20" flood-color="#8A2A10" flood-opacity="0.3"/>
     </filter>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="14"/></filter>
   </defs>
-  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)" filter="url(#plate)"/>
-  <g filter="url(#shadow)" transform="translate(512 548)">
-    <path d="M -230 -40 A 230 230 0 0 1 230 -40 L 230 150 Q 230 210 170 210 L -170 210 Q -230 210 -230 150 Z" fill="url(#guy)"/>
-    <rect x="-150" y="190" width="110" height="80" rx="40" fill="url(#guy)"/>
-    <rect x="40" y="190" width="110" height="80" rx="40" fill="url(#guy)"/>
+
+  <path d="${plate}" fill="url(#bg)" filter="url(#plateShadow)"/>
+  <g clip-path="url(#plateClip)">
+    <rect width="1024" height="1024" fill="url(#vignette)"/>
+    <rect width="1024" height="1024" fill="url(#sheen)"/>
   </g>
-  <g transform="translate(512 548)">
-    <ellipse cx="-78" cy="-34" rx="36" ry="50" fill="#2B1B14"/>
-    <ellipse cx="78" cy="-34" rx="36" ry="50" fill="#2B1B14"/>
-    <circle cx="-66" cy="-52" r="12" fill="#fff"/>
-    <circle cx="90" cy="-52" r="12" fill="#fff"/>
-    <ellipse cx="-150" cy="40" rx="34" ry="20" fill="#FF8A8A" opacity="0.55"/>
-    <ellipse cx="150" cy="40" rx="34" ry="20" fill="#FF8A8A" opacity="0.55"/>
-    <path d="M -34 40 Q 0 72 34 40" stroke="#2B1B14" stroke-width="16" fill="none" stroke-linecap="round"/>
+
+  <!-- contact shadows -->
+  <ellipse cx="282" cy="716" rx="104" ry="16" fill="#9C2F12" opacity="0.3" filter="url(#soft)"/>
+  <ellipse cx="560" cy="788" rx="176" ry="22" fill="#9C2F12" opacity="0.34" filter="url(#soft)"/>
+
+  <!-- the friend, peeking from behind -->
+  <g transform="translate(282 584)" filter="url(#lift)">
+    ${guyShape(124, "url(#pal)")}
+    ${face(124, { look: 1.4, blush: "#FF5C8A", blushOpacity: 0.42 })}
+  </g>
+
+  <!-- the main guy -->
+  <g transform="translate(560 574)" filter="url(#lift)">
+    ${guyShape(204, "url(#guy)")}
+    <ellipse cx="-88" cy="-122" rx="66" ry="36" transform="rotate(-24 -88 -122)" fill="#FFFFFF" opacity="0.9"/>
+    ${face(204, { look: -0.4 })}
+  </g>
+
+  <!-- chat bubble, typing -->
+  <g transform="translate(712 256)" filter="url(#lift)">
+    <path d="M -116 -64 h 232 a 64 64 0 0 1 64 64 v 0 a 64 64 0 0 1 -64 64 h -150 l -58 44 l 6 -46 a 64 64 0 0 1 -94 -62 v 0 a 64 64 0 0 1 64 -64 z" fill="url(#bubble)"/>
+    <circle cx="-62" cy="0" r="22" fill="#FF8F4E"/>
+    <circle cx="0" cy="0" r="22" fill="#FF8F4E" opacity="0.75"/>
+    <circle cx="62" cy="0" r="22" fill="#FF8F4E" opacity="0.5"/>
   </g>
 </svg>`;
 fs.writeFileSync(path.join(iconDir, "app-icon.png"), new Resvg(appIcon).render().asPng());
