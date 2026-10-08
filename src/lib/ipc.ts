@@ -130,6 +130,9 @@ export const core = {
       "gw_media",
       { gateway, source, sessionKey: sessionKey ?? null, agentId: agentId ?? null },
     ),
+  /** Save a chat attachment (http(s) or data: URL) to ~/Downloads; resolves to its path. */
+  saveMedia: (url: string, fileName?: string, gateway?: string) =>
+    invoke<string>("save_media", { url, fileName: fileName ?? null, gateway: gateway ?? null }),
   browser: {
     /** Relay a guy's browser tab; resolves once streaming, with a `stop()`. */
     stream: async (gateway: string, options: BrowserStreamOptions, onMessage: (m: BrowserStreamMessage) => void) => {

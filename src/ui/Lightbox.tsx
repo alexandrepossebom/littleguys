@@ -4,12 +4,14 @@ import { ExternalLink, X } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { openExternal } from "./openExternal";
+import { type Save, saveIcon, saveLabel, saveTitle } from "./useSave";
 
 export function Lightbox({
   kind,
   src,
   name,
   startAt = 0,
+  save,
   onClose,
 }: {
   kind: "image" | "video";
@@ -17,10 +19,12 @@ export function Lightbox({
   name: string;
   /** Video: where the inline player was, so playback continues. */
   startAt?: number;
+  save?: Save;
   onClose: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canOpen = /^https?:/i.test(src);
+  const SaveIcon = save && saveIcon(save);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -43,6 +47,16 @@ export function Lightbox({
     >
       <div className="flex h-12 shrink-0 items-center gap-2 px-4 text-white" onClick={(e) => e.stopPropagation()}>
         <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-white/85">{name}</span>
+        {save && SaveIcon && (
+          <button
+            onClick={save.run}
+            disabled={save.status === "saving"}
+            title={saveTitle(save)}
+            className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-medium text-white/80 transition hover:bg-white/10 hover:text-white ${save.status === "saving" ? "animate-pulse" : ""}`}
+          >
+            <SaveIcon size={13} /> {saveLabel(save)}
+          </button>
+        )}
         {canOpen && (
           <button
             onClick={() => openExternal(src)}

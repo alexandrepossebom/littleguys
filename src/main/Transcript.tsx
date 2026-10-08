@@ -3,7 +3,6 @@ import {
   Check,
   ChevronRight,
   Clock,
-  Download,
   File as FileIcon,
   FilePen,
   FileText,
@@ -34,7 +33,7 @@ import { Avatar } from "../ui/Avatar";
 import { Lightbox } from "../ui/Lightbox";
 import { TypingDots } from "../ui/kit";
 import { Markdown } from "../ui/Markdown";
-import { openExternal } from "../ui/openExternal";
+import { type Save, saveIcon, saveLabel, saveTitle, useSave } from "../ui/useSave";
 
 // ---- rendering --------------------------------------------------------------
 
@@ -528,16 +527,12 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
     };
   }, [src, inline, failed, artifactId, media.url, media.path, origin, where.gatewayId, where.sessionKey]);
 
-  const open = async () => {
-    try {
-      const url = artifactId ? await resolveArtifactUrl(where.gatewayId, where.sessionKey, artifactId, origin) : src;
-      if (url) openExternal(url);
-    } catch (e) {
-      setFailed(errorMessage(e));
-    }
-  };
-
   const name = media.fileName ?? (kind === "image" ? "Image" : kind === "video" ? "Video" : "File");
+  const save = useSave(
+    () => (artifactId ? resolveArtifactUrl(where.gatewayId, where.sessionKey, artifactId, origin) : Promise.resolve(src)),
+    name,
+    where.gatewayId,
+  );
   const onBot = media.path && !artifactId && !src && pathState === "gone";
 
   // Not retrievable: a file that only exists on the bot's machine.
@@ -553,11 +548,13 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
   }
 
   if (failed) {
-    return <FileCard icon={kind} name={name} detail="couldn't load" title={failed} broken />;
+    // Can't show it here (e.g. a video format WebKit won't play), but it may still save fine.
+    const savable = Boolean(src || artifactId);
+    return <FileCard icon={kind} name={name} detail="couldn't load" title={failed} broken save={savable ? save : undefined} />;
   }
 
   if (kind === "file") {
-    return <FileCard icon="file" name={name} detail={formatSize(sizeBytes)} onOpen={open} />;
+    return <FileCard icon="file" name={name} detail={formatSize(sizeBytes)} save={save} />;
   }
 
   if (!src) {
@@ -574,7 +571,7 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
     setViewing({ startAt: v?.currentTime ?? 0 });
   };
   const viewer = viewing && src && (kind === "image" || kind === "video") && (
-    <Lightbox kind={kind} src={src} name={name} startAt={viewing.startAt} onClose={() => setViewing(null)} />
+    <Lightbox kind={kind} src={src} name={name} startAt={viewing.startAt} save={save} onClose={() => setViewing(null)} />
   );
 
   if (kind === "video") {
@@ -597,7 +594,7 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
         >
           <Maximize2 size={13} />
         </button>
-        <FileCaption name={name} size={sizeBytes} onOpen={expand} label="View" />
+        <FileCaption name={name} size={sizeBytes} save={save} onView={expand} />
         {viewer}
       </div>
     );
@@ -606,7 +603,7 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
     return (
       <div className="w-[320px]">
         <audio src={src} controls preload="metadata" onError={() => setFailed("This audio couldn't be played here.")} className="w-full" />
-        <FileCaption name={name} size={sizeBytes} onOpen={open} />
+        <FileCaption name={name} size={sizeBytes} save={save} />
       </div>
     );
   }
@@ -625,14 +622,27 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
   );
 }
 
-function FileCaption({ name, size, onOpen, label = "Open" }: { name: string; size?: number; onOpen: () => void; label?: string }) {
+function FileCaption({ name, size, save, onView }: { name: string; size?: number; save: Save; onView?: () => void }) {
+  const SaveIcon = saveIcon(save);
   return (
     <div className="mt-1 flex items-center gap-1.5 px-1 text-[11px] text-[var(--color-ink-3)]">
       <span className="truncate">{name}</span>
-      {size ? <span>· {formatSize(size)}</span> : null}
-      <button onClick={onOpen} className="ml-auto flex items-center gap-0.5 hover:text-[var(--color-ink)]" title={label}>
-        {label === "Open" ? <Download size={11} /> : <Maximize2 size={11} />} {label}
-      </button>
+      {size ? <span className="shrink-0">· {formatSize(size)}</span> : null}
+      <span className="ml-auto flex shrink-0 items-center gap-2.5">
+        {onView && (
+          <button onClick={onView} className="flex items-center gap-0.5 hover:text-[var(--color-ink)]">
+            <Maximize2 size={11} /> View
+          </button>
+        )}
+        <button
+          onClick={save.run}
+          disabled={save.status === "saving"}
+          title={saveTitle(save)}
+          className={`flex items-center gap-0.5 hover:text-[var(--color-ink)] ${save.status === "saving" ? "animate-pulse" : ""}`}
+        >
+          <SaveIcon size={11} /> {saveLabel(save)}
+        </button>
+      </span>
     </div>
   );
 }
@@ -642,21 +652,28 @@ function FileCard({
   name,
   detail,
   title,
-  onOpen,
+  save,
   broken,
 }: {
   icon: MediaRef["kind"];
   name: string;
   detail?: string;
   title?: string;
-  onOpen?: () => void;
+  /** Clicking the card saves the file to Downloads. */
+  save?: Save;
   broken?: boolean;
 }) {
   const Icon = broken ? ImageOff : icon === "video" ? Film : icon === "audio" ? Music : icon === "image" ? FileIcon : FileIcon;
+  const SaveIcon = save && saveIcon(save);
+  const busy = save?.status === "saving";
+  if (save && save.status !== "idle") {
+    detail = saveLabel(save);
+    title = saveTitle(save);
+  }
   return (
     <button
-      onClick={onOpen}
-      disabled={!onOpen}
+      onClick={save?.run}
+      disabled={!save || busy}
       title={title}
       className="flex max-w-[360px] items-center gap-2.5 rounded-xl border border-[var(--color-line)] bg-[var(--color-pane-solid)] px-3 py-2 text-left transition enabled:hover:border-[var(--color-ink-3)]/40"
     >
@@ -667,7 +684,7 @@ function FileCard({
         <span className="block truncate text-[12.5px] font-medium text-[var(--color-ink)]">{name}</span>
         {detail && <span className="block truncate text-[11px] text-[var(--color-ink-3)]">{detail}</span>}
       </span>
-      {onOpen && <Download size={13} className="ml-1 shrink-0 text-[var(--color-ink-3)]" />}
+      {SaveIcon && <SaveIcon size={13} className={`ml-1 shrink-0 text-[var(--color-ink-3)] ${busy ? "animate-pulse" : ""}`} />}
     </button>
   );
 }
