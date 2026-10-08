@@ -143,6 +143,10 @@ const history: Record<string, ChatMessage[]> = {
       ...oc("a3"),
     },
   ],
+  "openclaw|agent:main:dashboard:a1": [
+    { role: "user", content: "Can you read me the itinerary out loud?", timestamp: now - 2 * 60 * min - 60_000, ...oc("j1") },
+    { role: "assistant", content: [{ type: "text", text: "Here's a 10-day itinerary that keeps travel under 3h/day.\n\nMEDIA:/home/guy/.openclaw/media/japan-itinerary.mp3" }], timestamp: now - 2 * 60 * min, ...oc("j2") },
+  ],
   "gw-garage1|agent:main:main": [
     { role: "user", content: "the auth test keeps flaking on CI, can you take a look?", timestamp: now - 50 * min, ...oc("u1") },
     { role: "assistant", content: [{ type: "toolCall", id: "x1", name: "exec", arguments: { command: "pnpm test auth --repeat 20" } }], timestamp: now - 45 * min, ...oc("a1") },
@@ -396,6 +400,30 @@ async function gwCall(gateway: string, method: string, p: Record<string, unknown
   }
 }
 
+/** Half a second of silence, for `MEDIA:` audio served by the gateway. */
+function silentWav(): string {
+  const rate = 16_000;
+  const samples = rate / 2;
+  const view = new DataView(new ArrayBuffer(44 + samples * 2));
+  const ascii = (at: number, s: string) => [...s].forEach((c, i) => view.setUint8(at + i, c.charCodeAt(0)));
+  ascii(0, "RIFF");
+  view.setUint32(4, 36 + samples * 2, true);
+  ascii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  ascii(36, "data");
+  view.setUint32(40, samples * 2, true);
+  const bytes = new Uint8Array(view.buffer);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return `data:audio/wav;base64,${btoa(bin)}`;
+}
+
 export const mockBackend: Backend = {
   async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
     switch (cmd) {
@@ -404,6 +432,9 @@ export const mockBackend: Backend = {
       case "get_roster":
       case "refresh_roster":
         return roster as T;
+      case "gw_media":
+        await new Promise((r) => setTimeout(r, 400)); // a round trip to the gateway
+        return { available: true, url: silentWav(), mimeType: "audio/wav", sizeBytes: 16_044 } as T;
       case "gw_call":
         return (await gwCall(String(args?.gateway), String(args?.method), (args?.params ?? {}) as Record<string, unknown>)) as T;
       case "browser_stream_start": {

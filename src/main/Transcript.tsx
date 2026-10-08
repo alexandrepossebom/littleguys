@@ -492,8 +492,9 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
   }, [media.path, media.fileName, artifactId, where.gatewayId, where.sessionKey]);
 
   // No stored copy: OpenClaw can serve the file straight from the guy's machine.
+  // (Not keyed on pathState: setting it to "loading" would cancel this very request.)
   useEffect(() => {
-    if (!media.path || artifactId || !lookedUp || pathState !== "idle") return;
+    if (!media.path || artifactId || !lookedUp) return;
     if (gateway?.status.kind !== "openclaw") return setPathState("gone");
     let cancelled = false;
     setPathState("loading");
@@ -509,7 +510,7 @@ function MediaView({ media, where }: { media: MediaRef; where: Where }) {
     return () => {
       cancelled = true;
     };
-  }, [media.path, artifactId, lookedUp, pathState, gateway?.status.kind, where.gatewayId, where.sessionKey]);
+  }, [media.path, artifactId, lookedUp, gateway?.status.kind, where.gatewayId, where.sessionKey]);
 
   // Inline media resolves its URL right away; files wait for a click.
   useEffect(() => {
