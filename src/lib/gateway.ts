@@ -76,7 +76,8 @@ export interface ChatHistory {
 export const chat = {
   history: (gw: string, sessionKey: string, limit = 200) =>
     gwCall<ChatHistory>(gw, "chat.history", { sessionKey, limit, maxChars: 40_000 }, 60_000),
-  send: (gw: string, sessionKey: string, message: string, attachments: Attachment[] = []) =>
+  /** `cwd`: folder for a thread's first message (ACP agents). */
+  send: (gw: string, sessionKey: string, message: string, attachments: Attachment[] = [], cwd?: string) =>
     gwCall<{ runId: string; status: string }>(
       gw,
       "chat.send",
@@ -84,6 +85,7 @@ export const chat = {
         sessionKey,
         message,
         idempotencyKey: newIdempotencyKey(),
+        ...(cwd ? { cwd } : {}),
         ...(attachments.length
           ? {
               attachments: attachments.map(({ type, mimeType, fileName, content, sizeBytes }) => ({

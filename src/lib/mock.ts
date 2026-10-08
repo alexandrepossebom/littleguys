@@ -104,7 +104,10 @@ hermes.status = { ...hermes.status, kind: "hermes", capabilities: { ...hermes.st
 const claude = gateway("acp-claude", "Claude Code", "npx -y @agentclientprotocol/claude-agent-acp", "connected", {
   defaultAgentId: "bot",
   agents: [{ id: "bot", name: "Claude", identity: { name: "Claude", emoji: "✳️" }, workspace: "/Users/you/dev/littleguy" }] as never,
-  sessions: [{ key: "agent:bot:main", agentId: "bot", kind: "direct", updatedAt: now - 5 * min, lastMessagePreview: "Tests pass — 21/21." }] as never,
+  sessions: [
+    { key: "agent:bot:main", agentId: "bot", kind: "direct", updatedAt: now - 5 * min, lastMessagePreview: "Tests pass — 21/21.", workspaceDir: "/Users/you/dev/littleguy" },
+    { key: "agent:bot:dashboard:b1", agentId: "bot", kind: "direct", label: "Invoice export", updatedAt: now - 2 * 60 * min, lastMessagePreview: "CSV export is in.", workspaceDir: "/Users/you/dev/billing-api" },
+  ] as never,
 });
 claude.status = {
   ...claude.status,

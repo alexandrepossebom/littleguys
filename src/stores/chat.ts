@@ -46,7 +46,8 @@ interface ChatState {
   threads: Record<string, ThreadState>;
   open(id: string): Promise<void>;
   reload(id: string): Promise<void>;
-  send(id: string, text: string, attachments: Attachment[]): Promise<void>;
+  /** `cwd`: folder for a thread's first message (ACP agents). */
+  send(id: string, text: string, attachments: Attachment[], cwd?: string): Promise<void>;
   abort(id: string): Promise<void>;
   handleEvent(gateway: string, name: string, payload: Record<string, unknown>): void;
   resubscribe(gateway: string): void;
@@ -115,7 +116,7 @@ export const useChat = create<ChatState>((set, get) => {
       }
     },
 
-    async send(key, text, attachments) {
+    async send(key, text, attachments, cwd) {
       const idempotencyKey = crypto.randomUUID();
       const optimistic: ChatMessage = {
         role: "user",
@@ -133,7 +134,7 @@ export const useChat = create<ChatState>((set, get) => {
       }));
       const [gw, sessionKey] = splitThreadId(key);
       try {
-        const res = await chatApi.send(gw, sessionKey, text, attachments);
+        const res = await chatApi.send(gw, sessionKey, text, attachments, cwd);
         patch(key, (t) => ({
           live: t.live ?? { runId: res.runId, text: "", phase: "sending", startedAt: Date.now() },
           // chat.send uses its own idempotency key; re-key the optimistic entry by runId.

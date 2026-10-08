@@ -344,6 +344,8 @@ struct PromptInput {
     /// What the transcript shows for the user's message.
     shown: Vec<Value>,
     text: String,
+    /// Folder picked for a thread that hasn't started yet.
+    cwd: Option<PathBuf>,
 }
 
 struct TurnResult {
@@ -1040,6 +1042,21 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// `~`-expanded and absolute (relative paths are under home).
+fn resolve_path(path: &str) -> PathBuf {
+    let path = expand_tilde(path.trim());
+    if path.is_absolute() {
+        path
+    } else {
+        dirs::home_dir().unwrap_or_default().join(path)
+    }
+}
+
+/// `resolve_path`, if it's an existing folder.
+fn resolve_dir(path: &str) -> Option<PathBuf> {
+    Some(resolve_path(path)).filter(|p| p.is_dir())
+}
+
 // ============================================================================
 // Inner: status, events, incoming agent messages
 // ============================================================================
@@ -1096,15 +1113,7 @@ impl Inner {
     /// The folder the agent works in (absolute; created if it's ours).
     fn workspace(&self) -> Result<PathBuf, String> {
         match self.config.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-            Some(cwd) => {
-                let path = expand_tilde(cwd);
-                let path = if path.is_absolute() { path } else { dirs::home_dir().unwrap_or_default().join(path) };
-                if path.is_dir() {
-                    Ok(path)
-                } else {
-                    Err(format!("The agent's folder {} doesn't exist.", path.display()))
-                }
-            }
+            Some(cwd) => resolve_dir(cwd).ok_or_else(|| format!("The agent's folder {} doesn't exist.", resolve_path(cwd).display())),
             None => {
                 let path = self.dir.join("workspace");
                 std::fs::create_dir_all(&path).map_err(|e| format!("Couldn't create {}: {e}", path.display()))?;
@@ -1118,6 +1127,12 @@ impl Inner {
             .unwrap_or_else(|_| self.dir.join("workspace"))
             .display()
             .to_string()
+    }
+
+    /// The folder a thread works in: its own, else the guy's.
+    fn thread_cwd(&self, key: &str) -> String {
+        let own = self.store.lock().unwrap().get(key).and_then(|m| m.cwd.clone());
+        own.unwrap_or_else(|| self.cwd_string())
     }
 
     fn auth_hint(&self) -> String {
@@ -1325,7 +1340,7 @@ impl Inner {
                 "command": command,
                 "agentId": AGENT_ID,
                 "sessionKey": key,
-                "cwd": self.cwd_string(),
+                "cwd": self.thread_cwd(&key),
                 "toolCallId": tool.get("toolCallId"),
                 "toolKind": tool.get("kind"),
             },
@@ -1441,6 +1456,7 @@ impl Inner {
         let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(500) as usize;
         let listed = self.agent_sessions().await;
         let running: HashSet<String> = self.runs.lock().unwrap().keys().cloned().collect();
+        let cwd = self.cwd_string();
         let store = self.store.lock().unwrap();
         let mut known: HashSet<String> = store.index.hidden.iter().cloned().collect();
         let mut rows: Vec<Value> = Vec::new();
@@ -1448,13 +1464,13 @@ impl Inner {
             known.extend(meta.session_id.iter().cloned());
             known.extend(meta.aliases.iter().cloned());
             known.extend(implied_session_id(&meta.key));
-            rows.push(session_row(meta, running.contains(&meta.key)));
+            rows.push(session_row(meta, running.contains(&meta.key), &cwd));
         }
         drop(store);
         for info in &listed {
             let Some(sid) = info.get("sessionId").and_then(Value::as_str) else { continue };
             if known.insert(sid.to_string()) {
-                rows.push(listed_row(info));
+                rows.push(listed_row(info, &cwd));
             }
         }
         rows.sort_by_key(|r| std::cmp::Reverse(r.get("updatedAt").and_then(Value::as_u64).unwrap_or(0)));
@@ -1552,7 +1568,7 @@ impl Inner {
         // In its own task: a slow session/new still gets indexed if this call times out.
         let inner = self.clone();
         let task = tauri::async_runtime::spawn(async move {
-            let sid = inner.new_session(&conn).await.map_err(|e| inner.rpc_error(&e))?;
+            let sid = inner.new_session(&conn, &inner.cwd_string()).await.map_err(|e| inner.rpc_error(&e))?;
             let key = keys::thread(AGENT_ID, &sid);
             let now = now_ms();
             {
@@ -1577,6 +1593,7 @@ impl Inner {
         let key = session_key(params)?;
         self.ensure_meta(&key);
         let running = self.runs.lock().unwrap().contains_key(&key);
+        let cwd = self.cwd_string();
         let mut store = self.store.lock().unwrap();
         let meta = store.get_mut(&key).ok_or_else(|| RpcError::new("NOT_FOUND", "no such thread"))?;
         if let Some(label) = params.get("label") {
@@ -1591,7 +1608,7 @@ impl Inner {
         if let Some(v) = params.get("archived").and_then(Value::as_bool) {
             meta.archived = v;
         }
-        let row = session_row(meta, running);
+        let row = session_row(meta, running, &cwd);
         store.save();
         Ok(row)
     }
@@ -1730,7 +1747,7 @@ impl Inner {
         let replay = if collect { Replay::Collect(Box::new(Collector::new(key))) } else { Replay::Ignore };
         self.replays.lock().unwrap().insert(sid.to_string(), replay);
         let _guard = ReplayGuard { inner: self.clone(), sid: sid.to_string() };
-        let params = json!({ "sessionId": sid, "cwd": self.cwd_string(), "mcpServers": [] });
+        let params = json!({ "sessionId": sid, "cwd": self.thread_cwd(key), "mcpServers": [] });
         conn.request("session/load", params, Some(SESSION_TIMEOUT)).await?;
         let replay = self.replays.lock().unwrap().remove(sid);
         Ok(match replay {
@@ -1741,9 +1758,9 @@ impl Inner {
 
     // ---- sessions on the agent ---------------------------------------------------
 
-    /// `session/new` (authenticating once if the agent asks for it).
-    async fn new_session(&self, conn: &Arc<Conn>) -> Result<String, AcpError> {
-        let params = json!({ "cwd": self.cwd_string(), "mcpServers": [] });
+    /// `session/new` in `cwd` (authenticating once if the agent asks for it).
+    async fn new_session(&self, conn: &Arc<Conn>, cwd: &str) -> Result<String, AcpError> {
+        let params = json!({ "cwd": cwd, "mcpServers": [] });
         let result = match conn.request("session/new", params.clone(), Some(SESSION_TIMEOUT)).await {
             Err(e) if e.is_auth() && self.try_authenticate(conn).await => {
                 conn.request("session/new", params, Some(SESSION_TIMEOUT)).await?
@@ -1793,16 +1810,51 @@ impl Inner {
         }
     }
 
+    /// Point a thread that hasn't started yet at another folder. ACP sessions
+    /// are bound to their folder, so an empty one is swapped for a fresh one there.
+    async fn move_thread(&self, key: &str, cwd: Option<&Path>) -> Result<(), AcpError> {
+        let Some(cwd) = cwd else { return Ok(()) };
+        self.ensure_meta(key);
+        let target = cwd.display().to_string();
+        let (sid, used) = {
+            let store = self.store.lock().unwrap();
+            let meta = store.get(key);
+            // A title or preview means the agent has history for it, even if we couldn't load it.
+            let used = store.has_messages(key) || meta.is_some_and(|m| m.title.is_some() || m.last_preview.is_some());
+            (meta.and_then(|m| m.session_id.clone()), used)
+        };
+        if used || self.thread_cwd(key) == target {
+            return Ok(());
+        }
+        let own = (target != self.cwd_string()).then(|| target.clone());
+        let fresh = match sid {
+            Some(_) => Some(self.new_session(&self.require_conn()?, &target).await?),
+            None => None,
+        };
+        self.store.lock().unwrap().update(key, |m| {
+            m.cwd = own;
+            if let Some(fresh) = fresh {
+                m.aliases.extend(m.session_id.replace(fresh));
+            }
+        });
+        Ok(())
+    }
+
     /// Make the thread's ACP session usable in the current agent process.
     async fn ensure_live(self: &Arc<Self>, key: &str) -> Result<String, AcpError> {
         let conn = self.require_conn()?;
         self.ensure_meta(key);
-        let (sid, has_messages) = {
+        let (sid, has_messages, own_cwd) = {
             let store = self.store.lock().unwrap();
-            (store.get(key).and_then(|m| m.session_id.clone()), store.has_messages(key))
+            let meta = store.get(key);
+            (meta.and_then(|m| m.session_id.clone()), store.has_messages(key), meta.and_then(|m| m.cwd.clone()))
         };
+        if let Some(dir) = own_cwd.filter(|d| !Path::new(d).is_dir()) {
+            return Err(AcpError::new(-32602, format!("This thread's folder {dir} doesn't exist anymore.")));
+        }
+        let cwd = self.thread_cwd(key);
         let Some(sid) = sid else {
-            let sid = self.new_session(&conn).await?;
+            let sid = self.new_session(&conn, &cwd).await?;
             self.store.lock().unwrap().update(key, |m| m.session_id = Some(sid.clone()));
             return Ok(sid);
         };
@@ -1812,7 +1864,7 @@ impl Inner {
         let agent = self.agent();
         let fatal = |e: &AcpError| e.is_auth() || matches!(e.code, LOCAL_DISCONNECTED | LOCAL_NOT_CONNECTED);
         if agent.session_cap("resume") {
-            let params = json!({ "sessionId": sid, "cwd": self.cwd_string(), "mcpServers": [] });
+            let params = json!({ "sessionId": sid, "cwd": cwd, "mcpServers": [] });
             match conn.request("session/resume", params, Some(SESSION_TIMEOUT)).await {
                 Ok(_) => {
                     self.live.lock().unwrap().insert(sid.clone());
@@ -1835,7 +1887,7 @@ impl Inner {
                 Err(e) => log::info!("[acp {}] session/load {sid} failed: {e}", self.id),
             }
         }
-        let fresh = self.new_session(&conn).await?;
+        let fresh = self.new_session(&conn, &cwd).await?;
         self.store.lock().unwrap().update(key, |m| {
             if !m.aliases.contains(&sid) {
                 m.aliases.push(sid.clone());
@@ -1866,12 +1918,16 @@ impl Inner {
         if prompt.is_empty() {
             return Err(bad_request("Nothing to send."));
         }
+        let cwd = match param_str(params, &["cwd"]).map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) => Some(resolve_dir(c).ok_or_else(|| bad_request(&format!("{} isn't a folder.", resolve_path(c).display())))?),
+            None => None,
+        };
         self.require_conn().map_err(|e| e.to_rpc())?;
         let run_id = uuid::Uuid::new_v4().to_string();
         let inner = self.clone();
         let (k, r) = (key.clone(), run_id.clone());
         tauri::async_runtime::spawn(async move {
-            let _ = inner.run_turn(k, r, PromptInput { prompt, shown, text }).await;
+            let _ = inner.run_turn(k, r, PromptInput { prompt, shown, text, cwd }).await;
         });
         Ok(json!({ "runId": run_id, "status": "started" }))
     }
@@ -1908,7 +1964,10 @@ impl Inner {
         self.emit("sessions.changed", json!({ "sessionKey": key, "agentId": AGENT_ID, "phase": "start" }));
         self.emit_chat(&key, &run_id, json!({ "state": "status", "phase": "preparing_workspace" }));
 
-        let live = self.ensure_live(&key).await;
+        let live = match self.move_thread(&key, input.cwd.as_deref()).await {
+            Ok(()) => self.ensure_live(&key).await,
+            Err(e) => Err(e),
+        };
         self.record_user_message(&key, &run_id, &input);
 
         let outcome: Result<String, AcpError> = match live {
@@ -2041,12 +2100,14 @@ impl Drop for ReplayGuard {
     }
 }
 
-fn session_row(meta: &SessionMeta, running: bool) -> Value {
+/// `cwd`: the guy's folder, for threads without their own.
+fn session_row(meta: &SessionMeta, running: bool, cwd: &str) -> Value {
     json!({
         "key": meta.key,
         "agentId": AGENT_ID,
         "kind": "direct",
         "sessionId": meta.session_id,
+        "workspaceDir": meta.cwd.as_deref().unwrap_or(cwd),
         "label": meta.label,
         "derivedTitle": meta.title,
         "lastMessagePreview": meta.last_preview,
@@ -2061,7 +2122,7 @@ fn session_row(meta: &SessionMeta, running: bool) -> Value {
 }
 
 /// A session the agent knows about but littleguys hasn't touched yet.
-fn listed_row(info: &Value) -> Value {
+fn listed_row(info: &Value, cwd: &str) -> Value {
     let sid = info.get("sessionId").and_then(Value::as_str).unwrap_or_default();
     let updated = info.get("updatedAt").and_then(Value::as_str).and_then(parse_iso_ms).unwrap_or(0);
     json!({
@@ -2069,6 +2130,7 @@ fn listed_row(info: &Value) -> Value {
         "agentId": AGENT_ID,
         "kind": "direct",
         "sessionId": sid,
+        "workspaceDir": info.get("cwd").and_then(Value::as_str).unwrap_or(cwd),
         "derivedTitle": info.get("title").and_then(Value::as_str),
         "createdAt": updated,
         "updatedAt": updated,
@@ -3497,7 +3559,7 @@ impl RoutineRunner for Runner {
             let key = match target.as_str() {
                 "" | "isolated" => {
                     let conn = inner.require_conn().map_err(|e| e.describe())?;
-                    let sid = inner.new_session(&conn).await.map_err(|e| inner.rpc_error(&e).message)?;
+                    let sid = inner.new_session(&conn, &inner.cwd_string()).await.map_err(|e| inner.rpc_error(&e).message)?;
                     let key = keys::routine_run(AGENT_ID, &job_id, &sid);
                     let job_name = inner
                         .scheduler
@@ -3529,6 +3591,7 @@ impl RoutineRunner for Runner {
                 prompt: vec![json!({ "type": "text", "text": message })],
                 shown: vec![json!({ "type": "text", "text": message })],
                 text: message,
+                cwd: None,
             };
             let result = inner.run_turn(key.clone(), run_id, input).await?;
             Ok(TurnOutcome { session_key: key, summary: result.final_text.map(|t| truncate(&clean_preview(&t), 300)) })
@@ -3564,6 +3627,9 @@ struct SessionMeta {
     /// User-given name.
     #[serde(default)]
     label: Option<String>,
+    /// The thread's own folder (absolute); None: the guy's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
     #[serde(default)]
     created_at: u64,
     #[serde(default)]
@@ -4360,5 +4426,27 @@ enabled = false
         assert!(claude_plugins(&json!({}), &[], "/w", |_: &str| None).is_empty());
         let ext = gemini_plugin("dir", &json!({ "name": "gemini-ext", "version": "1.2.3", "mcpServers": {} }));
         assert_eq!(ext, json!({ "id": "gemini-ext", "name": "gemini-ext", "version": "1.2.3", "enabled": true, "state": "enabled" }));
+    }
+    #[test]
+    fn threads_report_their_own_folder_or_the_guys() {
+        let own = SessionMeta { key: "agent:bot:dashboard:a".into(), cwd: Some("/proj".into()), ..Default::default() };
+        let plain = SessionMeta { key: "agent:bot:dashboard:b".into(), ..Default::default() };
+        assert_eq!(session_row(&own, false, "/guy")["workspaceDir"], "/proj");
+        assert_eq!(session_row(&plain, false, "/guy")["workspaceDir"], "/guy");
+        assert_eq!(listed_row(&json!({ "sessionId": "c", "cwd": "/term" }), "/guy")["workspaceDir"], "/term");
+        assert_eq!(listed_row(&json!({ "sessionId": "d" }), "/guy")["workspaceDir"], "/guy");
+        // Threads without their own folder keep the index unchanged on disk.
+        assert!(!serde_json::to_string(&plain).unwrap().contains("cwd"));
+    }
+
+    #[test]
+    fn folders_resolve_from_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(resolve_path("~"), home);
+        assert_eq!(resolve_path(" ~/x "), home.join("x"));
+        assert_eq!(resolve_path("x/y"), home.join("x/y"));
+        assert_eq!(resolve_path("/abs"), PathBuf::from("/abs"));
+        assert_eq!(resolve_dir("/"), Some(PathBuf::from("/")));
+        assert_eq!(resolve_dir("/definitely/not/here"), None);
     }
 }

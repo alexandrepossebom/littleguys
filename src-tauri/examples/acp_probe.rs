@@ -8,6 +8,7 @@
 //! - `PROBE_CWD`   the agent's folder (default `<PROBE_DATA>/cwd`)
 //! - `PROBE_DATA`  littleguys data dir (default `$TMPDIR/littleguys-acp-probe`)
 //! - `PROBE_KEY`   send to this thread (e.g. `agent:bot:main`) instead of a new one
+//! - `PROBE_THREAD_CWD` folder for the thread, sent with its first message
 //! - `PROBE_DECISION` answer to permission requests: allow-once|allow-always|deny (default) |
 //!   wait (leave them pending)
 //! - `PROBE_ABORT_MS` call `chat.abort` this long after each send
@@ -138,8 +139,12 @@ async fn main() -> anyhow::Result<()> {
     for prompt in &prompts {
         // Drop events from earlier turns.
         while rx.try_recv().is_ok() {}
+        let mut params = json!({ "sessionKey": key, "message": prompt, "idempotencyKey": uuid::Uuid::new_v4().to_string() });
+        if let Ok(cwd) = std::env::var("PROBE_THREAD_CWD") {
+            params["cwd"] = json!(cwd);
+        }
         let sent = client
-            .call("chat.send", json!({ "sessionKey": key, "message": prompt, "idempotencyKey": uuid::Uuid::new_v4().to_string() }))
+            .call("chat.send", params)
             .await
             .map_err(|e| anyhow::anyhow!("chat.send: {e}"))?;
         println!("== chat.send {prompt:?} → {sent}");
@@ -222,11 +227,12 @@ async fn main() -> anyhow::Result<()> {
             println!("== sessions.list");
             for row in list["sessions"].as_array().into_iter().flatten() {
                 println!(
-                    "   {} | {} | label={} | unread={} | {}",
+                    "   {} | {} | label={} | unread={} | in {} | {}",
                     row["key"],
                     row["derivedTitle"],
                     row["label"],
                     row["unread"],
+                    row["workspaceDir"],
                     row["lastMessagePreview"]
                 );
             }

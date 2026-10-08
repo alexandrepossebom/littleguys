@@ -1,7 +1,7 @@
 import { ArrowDown, Globe, RotateCw } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { sessions as sessionsApi } from "../lib/gateway";
-import { channelName, gatewayOf, guyName, hasMainChat, isRunning, phaseLabel, sessionRow, threadKind, threadTitle } from "../lib/guys";
+import { channelName, gatewayOf, guyName, hasMainChat, isOnThisMac, isRunning, phaseLabel, sessionRow, threadKind, threadTitle } from "../lib/guys";
 import { core } from "../lib/ipc";
 import { presentTense, toolKind } from "../lib/toolPhrases";
 import type { Guy } from "../lib/types";
@@ -11,6 +11,7 @@ import { Avatar, GuyMark } from "../ui/Avatar";
 import { Button, IconButton, Spinner } from "../ui/kit";
 import { Approvals } from "./Approvals";
 import { Composer } from "./Composer";
+import { FolderPicker, threadFolder, tildify, usePendingFolder } from "./FolderPicker";
 import { phaseLabel as livePhaseLabel, toItems, Transcript } from "./Transcript";
 
 export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) {
@@ -75,6 +76,15 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
     return null;
   }, [items, running, thread?.toolStatus]);
   const browsing = Boolean(activeTool && toolKind(activeTool.name) === "browse");
+  // ACP threads can start in any folder on this Mac; it's fixed once they have messages.
+  const [pendingFolder, setPendingFolder] = usePendingFolder(tid);
+  const folder = threadFolder(guy, row);
+  const canPickFolder = useApp((s) => {
+    const g = gatewayOf(s.roster, gw);
+    return g?.status.kind === "acp" && isOnThisMac(g) && kind !== "routine";
+  });
+  // A title or preview means it has history somewhere, even if none loaded.
+  const unstarted = Boolean(thread?.loaded) && items.length === 0 && !running && !row?.derivedTitle && !row?.lastMessagePreview;
   const activity = activeTool
     ? presentTense(activeTool)
     : live
@@ -89,7 +99,15 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <ChatHeader guy={guy} title={title} threadKey={tid} sessionKey={sessionKey} activity={activity} browsing={browsing} />
+      <ChatHeader
+        guy={guy}
+        title={title}
+        threadKey={tid}
+        sessionKey={sessionKey}
+        folder={canPickFolder && unstarted ? null : folder}
+        activity={activity}
+        browsing={browsing}
+      />
       <div
         ref={scrollRef}
         onScroll={(e) => {
@@ -151,6 +169,9 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
       )}
       <Approvals guy={guy} />
       <div className="mx-auto w-full max-w-[900px]">
+        {canPickFolder && unstarted && (pendingFolder ?? folder) && (
+          <FolderPicker guy={guy} value={(pendingFolder ?? folder) as string} onChange={setPendingFolder} />
+        )}
         <Composer
           gatewayId={gw}
           draftKey={tid}
@@ -158,7 +179,9 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
           running={running}
           onSend={async (text, attachments) => {
             stickToBottom.current = true;
-            await send(tid, text, attachments);
+            const cwd = canPickFolder && unstarted && pendingFolder !== folder ? (pendingFolder ?? undefined) : undefined;
+            await send(tid, text, attachments, cwd);
+            setPendingFolder(null);
           }}
           onStop={() => abort(tid)}
         />
@@ -173,6 +196,7 @@ function ChatHeader({
   title,
   threadKey,
   sessionKey,
+  folder,
   activity,
   browsing,
 }: {
@@ -180,6 +204,8 @@ function ChatHeader({
   title: string;
   threadKey: string;
   sessionKey: string;
+  /** Shown for ACP threads, which each work in a folder. */
+  folder: string | null;
   activity: string | null;
   browsing: boolean;
 }) {
@@ -193,6 +219,7 @@ function ChatHeader({
   const channelLabel = channel ? channel.charAt(0).toUpperCase() + channel.slice(1) : null;
   // The main chat is just "talking to Jefe"; other threads say which one this is.
   const isMain = kind === "main" && gateway?.status.kind !== "acp";
+  const showFolder = gateway?.status.kind === "acp" && folder;
   const threadLabel = isMain ? null : kind === "channel" ? `${title} on ${channelLabel}` : title;
 
   return (
@@ -216,7 +243,12 @@ function ChatHeader({
             <span className="text-[var(--color-ink-3)]">Routine run</span>
           ) : (
             <span className="flex items-center gap-1 text-[var(--color-ink-3)]">
-              <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-ok)]" /> online
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-ok)]" /> online
+              {showFolder && (
+                <span className="truncate" title={folder}>
+                  · in <span className="font-mono text-[11px]">{tildify(folder)}</span>
+                </span>
+              )}
             </span>
           )}
         </p>
