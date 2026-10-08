@@ -1,5 +1,5 @@
 import { ArrowDown, Globe, RotateCw } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { sessions as sessionsApi } from "../lib/gateway";
 import { channelName, gatewayOf, guyName, hasMainChat, isOnThisMac, isRunning, phaseLabel, sessionRow, threadKind, threadTitle } from "../lib/guys";
 import { core } from "../lib/ipc";
@@ -24,8 +24,22 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
   const { open, send, abort, reload } = useChat.getState();
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const stickToBottom = useRef(true);
+  // Follow mode: keep the newest message in view while anything grows (streaming
+  // text, images and code blocks laying out). Only scrolling up turns it off;
+  // scrolling back down to the bottom turns it on again.
+  const follow = useRef(true);
+  const lastTop = useRef(0);
   const [showJump, setShowJump] = useState(false);
+  const setFollow = useCallback((on: boolean) => {
+    follow.current = on;
+    setShowJump(!on);
+  }, []);
+  const pin = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el || !follow.current) return;
+    el.scrollTop = el.scrollHeight;
+    lastTop.current = el.scrollTop;
+  }, []);
 
   useEffect(() => {
     open(tid);
@@ -43,24 +57,19 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
   const live = thread?.live ?? null;
   const running = Boolean(live) || rosterRunning;
 
-  // Stay pinned to the bottom while new content streams in, unless the user scrolled up.
-  useLayoutEffect(() => {
-    const el = scrollRef.current;
-    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [items.length, live?.text, live?.phase, thread?.loaded]);
+  useLayoutEffect(pin, [pin, items.length, live?.text, live?.phase, thread?.loaded]);
 
-  // Images, videos and code blocks finish laying out after the first render;
-  // keep the newest message in view while they do (unless the user scrolled up).
+  // Images, videos and code blocks finish laying out after the first render, and
+  // the pane shrinks when approvals or a taller composer show up.
   useEffect(() => {
     const el = scrollRef.current;
     const content = contentRef.current;
     if (!el || !content) return;
-    const ro = new ResizeObserver(() => {
-      if (stickToBottom.current) el.scrollTop = el.scrollHeight;
-    });
+    const ro = new ResizeObserver(pin);
     ro.observe(content);
+    ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [pin]);
 
   const kind = threadKind(sessionKey);
   const mainChat = useApp((s) => hasMainChat(s.roster, gw));
@@ -112,9 +121,17 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
         ref={scrollRef}
         onScroll={(e) => {
           const el = e.currentTarget;
-          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-          stickToBottom.current = atBottom;
-          setShowJump(!atBottom);
+          const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+          // Content growing below never moves scrollTop, so being far from the
+          // bottom alone doesn't mean the user left it. Moving up does (unless the
+          // content shrank and clamped us, which leaves us at the bottom).
+          if (el.scrollTop < lastTop.current && gap > 1) setFollow(false);
+          else if (gap < 80) setFollow(true);
+          lastTop.current = el.scrollTop;
+        }}
+        // Catches a scroll up even when new content lands in the same frame.
+        onWheel={(e) => {
+          if (e.deltaY < 0 && e.currentTarget.scrollTop > 0) setFollow(false);
         }}
         className="relative min-h-0 flex-1 overflow-y-auto px-5 pb-4 pt-2"
       >
@@ -157,6 +174,7 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
         <div className="relative">
           <button
             onClick={() => {
+              setFollow(true);
               const el = scrollRef.current;
               if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
             }}
@@ -178,7 +196,7 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
           placeholder={kind === "channel" ? `Reply in ${channelName(sessionKey) ?? "channel"} as ${guyName(agent)}…` : `Message ${guyName(agent)}…`}
           running={running}
           onSend={async (text, attachments) => {
-            stickToBottom.current = true;
+            setFollow(true);
             const cwd = canPickFolder && unstarted && pendingFolder !== folder ? (pendingFolder ?? undefined) : undefined;
             await send(tid, text, attachments, cwd);
             setPendingFolder(null);
