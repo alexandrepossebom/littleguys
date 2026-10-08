@@ -192,6 +192,8 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
         )}
         <Composer
           gatewayId={gw}
+          agentId={guy.id}
+          sessionKey={sessionKey}
           draftKey={tid}
           placeholder={kind === "channel" ? `Reply in ${channelName(sessionKey) ?? "channel"} as ${guyName(agent)}…` : `Message ${guyName(agent)}…`}
           running={running}

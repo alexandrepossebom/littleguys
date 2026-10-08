@@ -23,6 +23,11 @@
 //! - `skills.status {agentId}` → `{agentId, skills:[{name, skillKey, description?, source, eligible, disabled,
 //!   filePath?, emoji?, missing?:{bins,env,config,os}}]}`; `skills.read {agentId, name}` → `{name, path?, content}`
 //!   (if `skills`; `source:"command"` marks a slash command)
+//! - `commands.list {agentId, sessionKey?}` → OpenClaw's `CommandsListResult`: `{commands:[{name, description,
+//!   source: native|skill|plugin, scope:"text", acceptsArgs?, textAliases?, args?:[{name, description, type,
+//!   required?, choices?:[{value,label}]}]}]}` (if `commands`; `name` has no leading `/`, `acceptsArgs` absent =
+//!   unknown). `chat.send` with `/name args` runs one; a command that answers without a turn returns
+//!   `status:"ok"` instead of `"started"` (its output arrives as `session.message`).
 //! - `tools.effective {agentId, sessionKey}` / `tools.catalog {agentId}` → `{agentId, groups:[{id, label, source,
 //!   tools:[{id, label, description?}]}], notices?}` (if `tools`)
 //! - `plugins.list` → `{plugins:[{id, name, description?, version?, enabled, state}]}`;
@@ -91,6 +96,8 @@ pub struct Capabilities {
     pub files: bool,
     /// Skills / slash commands can be listed (`skills.status`).
     pub skills: bool,
+    /// Slash commands can be listed for the composer (`commands.list`) and run with `chat.send`.
+    pub commands: bool,
     /// The guy's tools can be listed (`tools.effective` / `tools.catalog`).
     pub tools: bool,
     /// Plugins / MCP servers can be listed (`plugins.list`, `mcp.servers.list`).
@@ -112,6 +119,7 @@ impl Capabilities {
             models: true,
             files: true,
             skills: true,
+            commands: true,
             tools: true,
             plugins: true,
             browser: false,
@@ -127,6 +135,7 @@ impl Capabilities {
         Self {
             files: has("agents.workspace.list"),
             skills: has("skills.status"),
+            commands: has("commands.list"),
             tools: has("tools.catalog") || has("tools.effective"),
             plugins: has("plugins.list"),
             browser: admin && methods.as_ref().is_some_and(|list| list.contains(&"browser.request")),

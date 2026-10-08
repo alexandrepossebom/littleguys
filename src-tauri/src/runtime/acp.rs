@@ -93,6 +93,7 @@ impl AcpClient {
         };
         let scheduler = LocalScheduler::new(&data_dir, &id);
         let store = Store::open(dir.clone());
+        let commands = load_commands(&dir);
         Self {
             inner: Arc::new(Inner {
                 id,
@@ -117,7 +118,7 @@ impl AcpClient {
                 replays: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
                 list_cache: Mutex::new(None),
-                commands: Mutex::new(Vec::new()),
+                commands: Mutex::new(commands),
                 tried_auth: AtomicBool::new(false),
                 scheduler,
             }),
@@ -202,6 +203,7 @@ fn capabilities(attachments: bool, local: bool) -> Capabilities {
         models: false,
         files: local,
         skills: true,
+        commands: true,
         tools: false,
         plugins: local,
         browser: false,
@@ -271,7 +273,8 @@ struct Inner {
     replays: Mutex<HashMap<String, Replay>>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
     list_cache: Mutex<Option<(Instant, Vec<Value>)>>,
-    /// The agent's slash commands (latest `available_commands_update`).
+    /// The agent's slash commands (latest `available_commands_update`, kept in
+    /// `commands.json` so the composer has them before the first turn).
     commands: Mutex<Vec<Value>>,
     tried_auth: AtomicBool,
     scheduler: Arc<LocalScheduler>,
@@ -1223,7 +1226,11 @@ impl Inner {
         }
         if kind == "available_commands_update" {
             if let Some(commands) = update.get("availableCommands").and_then(Value::as_array) {
-                *self.commands.lock().unwrap() = commands.clone();
+                let mut current = self.commands.lock().unwrap();
+                if *current != *commands {
+                    *current = commands.clone();
+                    save_commands(&self.dir, commands);
+                }
             }
             return;
         }
@@ -1425,6 +1432,7 @@ impl Inner {
             "agents.workspace.list" | "agents.workspace.get" => self.workspace_call(method, params).await,
             "skills.status" => self.skills_status(&params).await,
             "skills.read" => self.skills_read(&params).await,
+            "commands.list" => self.commands_list(&params).await,
             "mcp.servers.list" => self.mcp_servers_list(method, &params).await,
             "plugins.list" => self.plugins_list(method).await,
             m if m.starts_with("cron.") => self.scheduler.handle(m, params).await,
@@ -2312,6 +2320,18 @@ impl Inner {
         Ok(json!({ "agentId": AGENT_ID, "skills": skills }))
     }
 
+    /// The announced slash commands for the composer; ones backed by a SKILL.md are `source: "skill"`.
+    async fn commands_list(&self, params: &Value) -> Result<Value, RpcError> {
+        check_agent(params)?;
+        let skill_names: HashSet<String> = if self.is_local() {
+            let dirs = self.skill_dirs();
+            blocking(move || Ok(scan_skills(&dirs))).await?.into_iter().map(|s| s.name).collect()
+        } else {
+            HashSet::new()
+        };
+        Ok(json!({ "commands": command_entries(&self.commands.lock().unwrap(), &skill_names) }))
+    }
+
     async fn skills_read(&self, params: &Value) -> Result<Value, RpcError> {
         check_agent(params)?;
         let name = param_str(params, &["name", "skillKey"])
@@ -2537,6 +2557,46 @@ fn yaml_value(head: &str, more: &[&str]) -> String {
         // Plain scalars end at a ` #` comment.
         text.split(" #").next().unwrap_or_default().trim().to_string()
     }
+}
+
+fn load_commands(dir: &Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join("commands.json")).ok().and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default()
+}
+
+fn save_commands(dir: &Path, commands: &[Value]) {
+    let saved = serde_json::to_vec_pretty(commands).map_err(|e| e.to_string()).and_then(|bytes| {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        write_private(&dir.join("commands.json"), &bytes).map_err(|e| e.to_string())
+    });
+    if let Err(e) = saved {
+        log::warn!("could not save ACP commands: {e}");
+    }
+}
+
+/// ACP `availableCommands` (`{name, description, input?:{hint}}`) → OpenClaw `CommandEntry`s.
+fn command_entries(commands: &[Value], skill_names: &HashSet<String>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    commands
+        .iter()
+        .filter_map(|command| {
+            let name = command.get("name")?.as_str()?.trim().trim_start_matches('/');
+            if name.is_empty() || !seen.insert(name.to_string()) {
+                return None;
+            }
+            let input = command.get("input").filter(|i| !i.is_null());
+            let mut entry = json!({
+                "name": name,
+                "description": command.get("description").and_then(Value::as_str).unwrap_or_default(),
+                "source": if skill_names.contains(name) { "skill" } else { "native" },
+                "scope": "text",
+                "acceptsArgs": input.is_some(),
+            });
+            if let Some(hint) = input.and_then(|i| i.get("hint")).and_then(Value::as_str).map(str::trim).filter(|h| !h.is_empty()) {
+                entry["args"] = json!([{ "name": hint, "description": "", "type": "string" }]);
+            }
+            Some(entry)
+        })
+        .collect()
 }
 
 /// ACP `availableCommands` → skill rows marked `source: "command"`.
@@ -4238,6 +4298,38 @@ mod tests {
         assert_eq!(front_matter(wrapped).1.as_deref(), Some("a long wrapped line"));
         assert_eq!(front_matter("# no front matter\nname: nope"), (None, None));
         assert_eq!(front_matter("---\nname:\n---"), (None, None));
+    }
+
+    #[test]
+    fn commands_become_command_entries() {
+        let commands = vec![
+            json!({ "name": "review", "description": "Review the diff", "input": { "hint": "branch or PR" } }),
+            json!({ "name": "/compact", "description": "Compact the chat", "input": null }),
+            json!({ "name": "pdf", "description": "Work with PDFs", "input": { "hint": "" } }),
+            json!({ "name": "review", "description": "dupe" }),
+        ];
+        let skills: HashSet<String> = ["pdf".to_string()].into();
+        let entries = command_entries(&commands, &skills);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0],
+            json!({ "name": "review", "description": "Review the diff", "source": "native", "scope": "text", "acceptsArgs": true,
+                    "args": [{ "name": "branch or PR", "description": "", "type": "string" }] })
+        );
+        assert_eq!(entries[1]["name"], "compact");
+        assert_eq!(entries[1]["acceptsArgs"], false);
+        assert_eq!(entries[2]["source"], "skill");
+        assert!(entries[2].get("args").is_none());
+    }
+
+    #[test]
+    fn commands_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("lg-acp-cmds-{}", uuid::Uuid::new_v4()));
+        assert!(load_commands(&dir).is_empty());
+        let commands = vec![json!({ "name": "review", "description": "Review the diff" })];
+        save_commands(&dir, &commands);
+        assert_eq!(load_commands(&dir), commands);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

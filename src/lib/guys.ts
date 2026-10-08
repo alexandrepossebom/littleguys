@@ -36,6 +36,7 @@ export const FULL_CAPS: Capabilities = {
   models: true,
   files: false,
   skills: false,
+  commands: false,
   tools: false,
   plugins: false,
   browser: false,

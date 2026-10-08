@@ -32,7 +32,7 @@ function status(id: string, name: string, url: string, phase: ConnStatus["phase"
     credentialIssue: null,
     hello: { policy: { attachments: { maxBytes: 20 << 20, maxImageBytes: 6 << 20 } } },
     kind: "openclaw",
-    capabilities: { manageGuys: true, routines: true, routinesLocal: false, approvals: true, threadActions: true, newThreads: true, attachments: true, models: true, files: true, skills: true, tools: true, plugins: true, browser: true },
+    capabilities: { manageGuys: true, routines: true, routinesLocal: false, approvals: true, threadActions: true, newThreads: true, attachments: true, models: true, files: true, skills: true, commands: true, tools: true, plugins: true, browser: true },
     ...extra,
   };
 }
@@ -113,7 +113,7 @@ claude.status = {
   ...claude.status,
   kind: "acp",
   mode: null,
-  capabilities: { manageGuys: false, routines: true, routinesLocal: true, approvals: true, threadActions: true, newThreads: true, attachments: true, models: false, files: true, skills: true, tools: false, plugins: true, browser: false },
+  capabilities: { manageGuys: false, routines: true, routinesLocal: true, approvals: true, threadActions: true, newThreads: true, attachments: true, models: false, files: true, skills: true, commands: true, tools: false, plugins: true, browser: false },
 };
 
 const roster: Roster = {
@@ -187,7 +187,9 @@ const discovered: DiscoveredGateway[] = [
 
 function streamReply(gateway: string, sessionKey: string, text: string) {
   const runId = crypto.randomUUID();
-  const reply = `You said: “${text}”. On it! 🫡\n\nThis is the mock backend — run \`pnpm tauri dev\` to talk to a real gateway.`;
+  const reply = text.startsWith("/")
+    ? `⚙️ Ran \`${text.split(/\s/)[0]}\` (mock).`
+    : `You said: “${text}”. On it! 🫡\n\nThis is the mock backend — run \`pnpm tauri dev\` to talk to a real gateway.`;
   const ev = (event: string, payload: object) => emit("gw:event", { gateway, event, payload: { sessionKey, ...payload } });
   ev("session.message", { message: { role: "user", content: text, timestamp: Date.now(), ...oc(crypto.randomUUID()) } });
   ev("chat", { runId, state: "status", phase: "starting_model" });
@@ -211,6 +213,31 @@ function streamReply(gateway: string, sessionKey: string, text: string) {
 }
 
 // ---- workspace / skills / browser fixtures ----
+
+const mockCommands = [
+  { name: "help", description: "Show available commands.", source: "native", scope: "text", acceptsArgs: false, category: "status" },
+  { name: "status", description: "Show current status.", source: "native", scope: "text", acceptsArgs: false, category: "status" },
+  { name: "new", description: "Start a new session.", source: "native", scope: "text", acceptsArgs: true, category: "session" },
+  { name: "reset", description: "Reset the current session.", source: "native", scope: "text", acceptsArgs: true, category: "session" },
+  { name: "compact", description: "Compact the session context.", source: "native", scope: "text", acceptsArgs: true, category: "session" },
+  { name: "think", textAliases: ["/think", "/thinking", "/t"], description: "Set thinking level.", source: "native", scope: "both", acceptsArgs: true, category: "options",
+    args: [{ name: "level", description: "Thinking level", type: "string", choices: ["off", "minimal", "low", "medium", "high"].map((v) => ({ value: v, label: v })) }] },
+  { name: "model", description: "Show or set the model.", source: "native", scope: "text", acceptsArgs: true, category: "options",
+    args: [{ name: "model", description: "Model id (provider/model or alias)", type: "string" }] },
+  { name: "verbose", textAliases: ["/verbose", "/v"], description: "Toggle verbose mode.", source: "native", scope: "both", acceptsArgs: true, category: "options",
+    args: [{ name: "mode", description: "on or off", type: "string", choices: [{ value: "on", label: "on" }, { value: "off", label: "off" }] }] },
+  { name: "usage", description: "Usage footer or cost summary.", source: "native", scope: "text", acceptsArgs: true, category: "status" },
+  { name: "weather", description: "Weather for any city, no API key needed.", source: "skill", scope: "both", acceptsArgs: true },
+  { name: "summarize", description: "Summarize a URL, file or video.", source: "skill", scope: "both", acceptsArgs: true },
+  { name: "pair", description: "Pair a phone with this gateway.", source: "plugin", scope: "both", acceptsArgs: true },
+];
+
+const mockAcpCommands = [
+  { name: "review", description: "Review the current diff", source: "native", scope: "text", acceptsArgs: true, args: [{ name: "branch or PR", description: "", type: "string" }] },
+  { name: "init", description: "Write a CLAUDE.md for this repo", source: "native", scope: "text", acceptsArgs: false },
+  { name: "compact", description: "Clear history but keep a summary in context", source: "native", scope: "text", acceptsArgs: true, args: [{ name: "instructions", description: "", type: "string" }] },
+  { name: "graphify", description: "Turn anything into a knowledge graph.", source: "skill", scope: "text", acceptsArgs: true },
+];
 
 const workspaceTree: Record<string, Array<{ name: string; kind: "file" | "directory"; size?: number }>> = {
   "": [
@@ -377,6 +404,8 @@ async function gwCall(gateway: string, method: string, p: Record<string, unknown
             { name: "graphify", skillKey: "graphify", description: "Turn anything into a knowledge graph.", source: "personal", eligible: true, filePath: "~/.claude/skills/graphify/SKILL.md" },
           ] }
         : { workspaceDir: "/Users/you/.openclaw/workspace-main", skills: mockSkills };
+    case "commands.list":
+      return { commands: gateway === "acp-claude" ? mockAcpCommands : mockCommands };
     case "skills.read":
       return { name: p.name, path: `~/.claude/skills/${p.name}/SKILL.md`, content: "---\nname: graphify\n---\n\n# graphify\n\nBuilds a knowledge graph from code and docs.\n" };
     case "tools.effective":

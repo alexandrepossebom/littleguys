@@ -3,10 +3,11 @@
 // for the Skills tab. Read-only.
 import { create } from "zustand";
 import { mainSessionKey } from "../stores/app";
-import { config, mcp, plugins, skills, tools, workspace } from "./gateway";
+import { usage } from "./commands";
+import { commands as commandsApi, config, mcp, plugins, skills, tools, workspace } from "./gateway";
 import { capsOf, gatewayOf } from "./guys";
 import { errorMessage } from "./ipc";
-import type { Guy, McpServer, PluginEntry, Roster, SkillEntry, ToolEntry, ToolGroup } from "./types";
+import type { CommandEntry, Guy, McpServer, PluginEntry, Roster, SkillEntry, ToolEntry, ToolGroup } from "./types";
 
 export type AbilityKind = "skill" | "command" | "tool" | "plugin" | "mcp";
 export type AbilityStatus = "ready" | "off" | "needs-setup" | "error";
@@ -90,6 +91,20 @@ function skillAbility(s: SkillEntry): Ability {
     statusNote,
     raw: s,
   };
+}
+
+/** A `commands.list` entry, shown like the command rows `skills.status` used to carry. */
+function commandAbility(c: CommandEntry): Ability {
+  const hint = usage(c).slice(c.name.length + 2);
+  return skillAbility({
+    name: c.name,
+    skillKey: `cmd:${c.name}`,
+    description: c.description,
+    source: "command",
+    category: c.category,
+    eligible: true,
+    ...(hint ? { hint } : {}),
+  });
 }
 
 const GROUP_SOURCE: Record<string, string> = { core: "Built in", plugin: "Plugin", channel: "Channel", mcp: "MCP server", toolset: "Toolset" };
@@ -195,8 +210,9 @@ export async function loadAbilities(roster: Roster, guy: Guy): Promise<AbilitySe
           const byStatus = (a: Ability, b: Ability) =>
             Number(a.status !== "ready") - Number(b.status !== "ready") || a.name.localeCompare(b.name);
           const out: AbilitySection[] = [{ id: "skills", title: "Skills", items: all.filter((a) => a.kind === "skill").sort(byStatus) }];
-          const commands = all.filter((a) => a.kind === "command").sort(byStatus);
-          if (commands.length || kind === "acp")
+          // With `commands.list`, the Slash commands section comes from there (below).
+          const commands = caps.commands ? [] : all.filter((a) => a.kind === "command").sort(byStatus);
+          if (!caps.commands && (commands.length || kind === "acp"))
             out.push({
               id: "commands",
               title: "Slash commands",
@@ -206,6 +222,20 @@ export async function loadAbilities(roster: Roster, guy: Guy): Promise<AbilitySe
           return out;
         })
         .catch((e) => ({ id: "skills" as const, title: "Skills", items: [], error: errorMessage(e) })),
+    );
+  }
+  if (caps.commands) {
+    jobs.push(
+      section("commands", "Slash commands", async () => {
+        const r = await commandsApi.list(gw, guy.id);
+        // Skill-backed commands are already listed under Skills.
+        return (r.commands ?? [])
+          .filter((c) => c.source !== "skill")
+          .map(commandAbility)
+          .sort((a, b) => a.name.localeCompare(b.name));
+      }).then((s) =>
+        !s.items.length && !s.error && kind === "acp" ? { ...s, note: "They show up once you've chatted with this agent." } : s,
+      ),
     );
   }
   if (caps.tools) {

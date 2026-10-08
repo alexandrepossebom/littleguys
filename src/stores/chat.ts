@@ -136,7 +136,8 @@ export const useChat = create<ChatState>((set, get) => {
       try {
         const res = await chatApi.send(gw, sessionKey, text, attachments, cwd);
         patch(key, (t) => ({
-          live: t.live ?? { runId: res.runId, text: "", phase: "sending", startedAt: Date.now() },
+          // "ok": a slash command answered without starting a turn.
+          live: t.live ?? (res.status === "ok" ? null : { runId: res.runId, text: "", phase: "sending", startedAt: Date.now() }),
           // chat.send uses its own idempotency key; re-key the optimistic entry by runId.
           pending: t.pending.map((p) => (p.idempotencyKey === idempotencyKey ? { ...p, idempotencyKey: res.runId } : p)),
         }));

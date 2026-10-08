@@ -23,7 +23,7 @@
 //! (the session titled exactly "Bot Chat"), created lazily on first send; the mapping is
 //! also remembered in `<data_dir>/hermes-<gatewayId>.json`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -427,6 +427,7 @@ fn capabilities(mode: HermesMode) -> Capabilities {
         models: false,
         files: local,
         skills: true,
+        commands: local,
         tools: true,
         plugins: local,
         browser: false,
@@ -574,6 +575,8 @@ impl HermesClient {
             "agents.workspace.get" => workspace_get(inner, &params, timeout).await,
             "skills.status" => skills_status(inner, &params, timeout).await,
             "skills.read" => skills_read(inner, &params, timeout).await,
+            "commands.list" if api => Err(unsupported(method)),
+            "commands.list" => commands_list(inner, &params, timeout).await,
             "tools.effective" | "tools.catalog" => tools_groups(inner, &params, timeout).await,
             "plugins.list" if api => Ok(json!({ "plugins": [] })),
             "plugins.list" => plugins_list(inner, &params, timeout).await,
@@ -2345,9 +2348,17 @@ async fn local_chat_send(inner: &Arc<Inner>, params: &Value, timeout: Duration) 
             (sid, stored)
         }
     };
+    // Slash commands go through Hermes' own pipeline; `prompt.submit` would hand them to the model.
+    let mut prompt = message.clone();
+    if let Some(command) = slash_command(&message) {
+        match run_slash(inner, &sid, command, timeout).await? {
+            Slash::Send(composed) => prompt = composed,
+            Slash::Output(output) => return Ok(slash_output(inner, &key, &message, &output)),
+        }
+    }
     let run_id = new_run_id();
     inner.st.lock().unwrap().queued_runs.entry(sid.clone()).or_default().push_back(run_id.clone());
-    let submit = |sid: String| rpc(inner, "prompt.submit", json!({ "session_id": sid, "text": message }), timeout);
+    let submit = |sid: String| rpc(inner, "prompt.submit", json!({ "session_id": sid, "text": prompt }), timeout);
     let res = match submit(sid.clone()).await {
         Ok(res) => res,
         Err(e) if e.code.starts_with("HERMES_4") => {
@@ -2392,6 +2403,79 @@ async fn local_chat_send(inner: &Arc<Inner>, params: &Value, timeout: Duration) 
     note_last_text(inner, &key, &message);
     emit(inner, "session.message", json!({ "sessionKey": key, "runId": run_id, "message": user_message(&message, id, &run_id) }));
     Ok(json!({ "runId": run_id, "status": "started", "hermesStatus": status }))
+}
+
+/// `/name args…` when the text starts with a command token (not a path like `/Users/me`).
+fn slash_command(message: &str) -> Option<&str> {
+    let text = message.trim();
+    let name = text.strip_prefix('/')?.split(char::is_whitespace).next()?;
+    let valid = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+    valid.then_some(text)
+}
+
+enum Slash {
+    /// Shown in the thread; nothing reaches the model.
+    Output(String),
+    /// The command composed a prompt (skills, /queue, /plan…): run it as the turn.
+    Send(String),
+}
+
+/// What Hermes' TUI and desktop do with a slash command: `slash.exec`, falling back to
+/// `command.dispatch` for the ones it refuses with 4018 (skills, bundles, pending-input
+/// built-ins), following aliases.
+async fn run_slash(inner: &Arc<Inner>, sid: &str, command: &str, timeout: Duration) -> Result<Slash, RpcError> {
+    let mut command = command.to_string();
+    for _ in 0..3 {
+        let res = match rpc(inner, "slash.exec", json!({ "session_id": sid, "command": command }), timeout).await {
+            Err(e) if e.code == "HERMES_4018" => {
+                let rest = command.trim_start_matches('/');
+                let (name, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                rpc(inner, "command.dispatch", json!({ "session_id": sid, "name": name, "arg": arg.trim() }), timeout).await?
+            }
+            res => res?,
+        };
+        let field = |k: &str| nonempty(&res, k).map(str::to_string);
+        match res.get("type").and_then(Value::as_str) {
+            Some("send" | "skill") => {
+                if let Some(message) = field("message") {
+                    return Ok(Slash::Send(message));
+                }
+            }
+            Some("alias") => {
+                if let Some(target) = field("target") {
+                    command = if target.starts_with('/') { target } else { format!("/{target}") };
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        let output = [field("notice"), field("output").or_else(|| field("message")), field("warning")];
+        let output: Vec<String> = output.into_iter().flatten().collect();
+        return Ok(Slash::Output(if output.is_empty() { "(no output)".into() } else { output.join("\n\n") }));
+    }
+    Err(RpcError::new("INVALID_REQUEST", "That command points at itself."))
+}
+
+/// A command's output, shown under what was typed. Hermes doesn't keep either in the
+/// transcript (its TUI shows them in a pager), so they're gone after a reload.
+fn slash_output(inner: &Inner, key: &str, typed: &str, output: &str) -> Value {
+    let run_id = new_run_id();
+    let text = if output.contains('\n') {
+        let fence = if output.contains("```") { "~~~~" } else { "```" };
+        format!("{fence}text\n{output}\n{fence}")
+    } else {
+        output.to_string()
+    };
+    emit(inner, "session.message", json!({ "sessionKey": key, "runId": run_id, "message": user_message(typed, format!("live:{run_id}:user"), &run_id) }));
+    let reply = json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": text }],
+        "timestamp": now_ms(),
+        "__openclaw": { "id": format!("live:{run_id}:output"), "runId": run_id },
+    });
+    emit(inner, "session.message", json!({ "sessionKey": key, "runId": run_id, "message": reply }));
+    json!({ "runId": run_id, "status": "ok" })
 }
 
 async fn chat_abort(inner: &Arc<Inner>, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
@@ -3597,6 +3681,78 @@ async fn skills_read(inner: &Inner, params: &Value, timeout: Duration) -> Result
     Ok(out)
 }
 
+/// Slash commands from `commands.catalog` (what Hermes' desktop reads), scoped to the guy's
+/// profile and, when the thread is live, its session (project-local skills).
+async fn commands_list(inner: &Inner, params: &Value, timeout: Duration) -> Result<Value, RpcError> {
+    let profile = agent_profile(inner, params)?;
+    let mut p = json!({});
+    if let Some(profile) = &profile {
+        p["profile"] = json!(profile);
+    }
+    if let Some(key) = params.get("sessionKey").and_then(Value::as_str) {
+        if let Ok((profile, Some(stored))) = resolve_key(inner, key) {
+            if let Some(sid) = inner.st.lock().unwrap().by_session.get(&(profile, stored)) {
+                p["session_id"] = json!(sid);
+            }
+        }
+    }
+    let catalog = rpc(inner, "commands.catalog", p, timeout).await?;
+    Ok(json!({ "commands": catalog_commands(&catalog) }))
+}
+
+/// `commands.catalog` (`pairs:[[/key, desc]]`, `categories:[{name, pairs}]`, `commands:{/key:
+/// {argument_mode, desktop, desktop_subcommands?}}`, `skills:{/key:…}`, `sub:{/key:[…]}`) →
+/// OpenClaw `CommandEntry`s. Leaves out what Hermes' desktop leaves out (`desktop` set:
+/// terminal-only or hidden) and the TUI's own display commands.
+fn catalog_commands(catalog: &Value) -> Vec<Value> {
+    let mut category: HashMap<&str, &str> = HashMap::new();
+    for c in list_of(catalog, "categories") {
+        let name = c.get("name").and_then(Value::as_str).unwrap_or_default();
+        for pair in list_of(c, "pairs") {
+            if let Some(key) = pair.get(0).and_then(Value::as_str) {
+                category.insert(key, name);
+            }
+        }
+    }
+    let skills = catalog.get("skills").and_then(Value::as_object);
+    let mut seen = HashSet::new();
+    list_of(catalog, "pairs")
+        .iter()
+        .filter_map(|pair| {
+            let key = pair.get(0)?.as_str()?.trim();
+            let name = key.trim_start_matches('/');
+            let cat = category.get(key).copied().unwrap_or_default();
+            if name.is_empty() || cat == "TUI" || !seen.insert(name.to_string()) {
+                return None;
+            }
+            let meta = catalog.pointer("/commands").and_then(|c| c.get(key));
+            if meta.and_then(|m| m.get("desktop")).and_then(Value::as_str).is_some_and(|d| !d.is_empty()) {
+                return None;
+            }
+            let skill = skills.is_some_and(|s| s.contains_key(key));
+            let source = if skill { "skill" } else if cat == "Plugin commands" { "plugin" } else { "native" };
+            let mut entry = json!({
+                "name": name,
+                "description": pair.get(1).and_then(Value::as_str).unwrap_or_default(),
+                "source": source,
+                "scope": "text",
+            });
+            if skill {
+                entry["acceptsArgs"] = json!(true);
+            } else if let Some(meta) = meta {
+                entry["acceptsArgs"] = json!(!meta.get("argument_mode").is_none_or(Value::is_null));
+                let subs = meta.get("desktop_subcommands").or_else(|| catalog.pointer("/sub").and_then(|s| s.get(key)));
+                let choices: Vec<Value> =
+                    subs.and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(|v| json!({ "value": v, "label": v })).collect();
+                if !choices.is_empty() {
+                    entry["args"] = json!([{ "name": "option", "description": "", "type": "string", "choices": choices }]);
+                }
+            }
+            Some(entry)
+        })
+        .collect()
+}
+
 /// Hermes toolsets (`/api/tools/toolsets` or `/v1/toolsets`: `{name, label, description,
 /// enabled, configured, tools:[names]}`) → OpenClaw tool groups, disabled ones included.
 fn tool_groups(v: &Value) -> Vec<Value> {
@@ -3787,6 +3943,43 @@ mod tests {
         assert!(normalize_http("  ", 1).is_err());
         assert!(is_loopback_url("http://127.0.0.1:9119"));
         assert!(!is_loopback_url("http://box.local:9119"));
+    }
+
+    #[test]
+    fn spots_slash_commands() {
+        assert_eq!(slash_command("/model gpt-5"), Some("/model gpt-5"));
+        assert_eq!(slash_command("  /status "), Some("/status"));
+        assert_eq!(slash_command("/skills:pdf do it"), Some("/skills:pdf do it"));
+        assert_eq!(slash_command("/Users/me/notes.md has the list"), None);
+        assert_eq!(slash_command("/ hi"), None);
+        assert_eq!(slash_command("hi /status"), None);
+        assert_eq!(slash_command("//x"), None);
+    }
+
+    #[test]
+    fn catalog_becomes_command_entries() {
+        let catalog = json!({
+            "pairs": [["/model", "Switch model (usage: /model [name])"], ["/quit", "Exit"], ["/help", "Show help"],
+                      ["/density", "Toggle compact display mode"], ["/standup", "exec: ./standup.sh"],
+                      ["/think", "Reasoning effort"], ["/pdf", "Work with PDFs"], ["/model", "dupe"]],
+            "categories": [{ "name": "Session", "pairs": [["/model", ""], ["/quit", ""], ["/help", ""], ["/think", ""]] },
+                           { "name": "TUI", "pairs": [["/density", ""]] },
+                           { "name": "User commands", "pairs": [["/standup", ""]] }],
+            "commands": { "/model": { "argument_mode": "text", "desktop": null }, "/quit": { "argument_mode": null, "desktop": "terminal" },
+                          "/help": { "argument_mode": null, "desktop": null },
+                          "/think": { "argument_mode": "options", "desktop": null, "desktop_subcommands": ["low", "high"] } },
+            "sub": { "/think": ["low", "medium", "high"] },
+            "skills": { "/pdf": { "usage": 3, "origin": "hub" } },
+        });
+        let entries = catalog_commands(&catalog);
+        let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["model", "help", "standup", "think", "pdf"]);
+        assert_eq!(entries[0], json!({ "name": "model", "description": "Switch model (usage: /model [name])", "source": "native", "scope": "text", "acceptsArgs": true }));
+        assert_eq!(entries[1]["acceptsArgs"], false);
+        assert!(entries[2].get("acceptsArgs").is_none());
+        assert_eq!(entries[3]["args"][0]["choices"], json!([{ "value": "low", "label": "low" }, { "value": "high", "label": "high" }]));
+        assert_eq!(entries[4]["source"], "skill");
+        assert_eq!(entries[4]["acceptsArgs"], true);
     }
 
     #[test]

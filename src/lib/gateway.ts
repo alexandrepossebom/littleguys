@@ -5,6 +5,7 @@ import type {
   AgentSummary,
   Attachment,
   ChatMessage,
+  CommandEntry,
   CronJob,
   CronRunLogEntry,
   McpServer,
@@ -165,6 +166,17 @@ export const skills = {
   /** SKILL.md of a skill (Hermes and ACP; OpenClaw reads it from the workspace). */
   read: (gw: string, agentId: string, name: string) =>
     gwCall<{ name: string; path?: string; content: string }>(gw, "skills.read", { agentId, name }),
+};
+
+export const commands = {
+  /** Slash commands the guy understands, for the composer. */
+  list: (gw: string, agentId: string, sessionKey?: string) =>
+    gwCall<{ commands: CommandEntry[] }>(
+      gw,
+      "commands.list",
+      { agentId, ...(sessionKey ? { sessionKey } : {}), scope: "text", includeArgs: true },
+      30_000,
+    ),
 };
 
 export const tools = {

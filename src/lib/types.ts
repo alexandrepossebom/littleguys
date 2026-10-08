@@ -36,6 +36,8 @@ export interface Capabilities {
   models: boolean;
   files: boolean;
   skills: boolean;
+  /** Slash commands can be listed for the composer (`commands.list`). */
+  commands: boolean;
   tools: boolean;
   plugins: boolean;
   browser: boolean;
@@ -290,6 +292,27 @@ export interface SkillEntry {
   primaryEnv?: string;
   missing?: Record<string, string[] | undefined>;
   install?: Array<{ id: string; kind: string; label: string; bins?: string[] }>;
+}
+
+/** A slash command (OpenClaw's `CommandEntry`; every runtime answers `commands.list` in this shape). */
+export interface CommandEntry {
+  /** Without the leading `/`. */
+  name: string;
+  description?: string;
+  source?: "native" | "skill" | "plugin";
+  category?: string;
+  /** Other ways to type it, with the `/` (OpenClaw). */
+  textAliases?: string[];
+  /** Unknown when absent. */
+  acceptsArgs?: boolean;
+  args?: Array<{
+    name: string;
+    description?: string;
+    type?: string;
+    required?: boolean;
+    choices?: Array<{ value: string; label: string }>;
+    dynamic?: boolean;
+  }>;
 }
 
 export interface ToolEntry {
