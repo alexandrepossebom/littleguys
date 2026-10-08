@@ -6,6 +6,9 @@ import type { ConnStatus, Guy, Navigate, Roster } from "../lib/types";
 
 const ORDER_KEY = "littleguys.order";
 const LAST_THREAD_KEY = "littleguys.lastThread";
+const LAST_GUY_KEY = "littleguys.lastGuy";
+/** How long launch waits for the last guy's gateway before showing someone else. */
+const RESTORE_WAIT_MS = 8_000;
 const BROWSER_KEY = "littleguys.browser";
 
 function readJson<T>(key: string, fallback: T): T {
@@ -33,6 +36,8 @@ interface AppState {
   selectedUid: string | null;
   selectedSessionKey: string | null;
   lastThreadByGuy: Record<string, string>;
+  /** The guy you were on last time, reopened at launch once their gateway is up. */
+  restoreUid: string | null;
   view: MainView;
   /** Open file in the Files tab, per guy (workspace-relative path). */
   fileByGuy: Record<string, string>;
@@ -73,6 +78,7 @@ export const useApp = create<AppState>((set, get) => ({
   selectedUid: null,
   selectedSessionKey: null,
   lastThreadByGuy: readJson<Record<string, string>>(LAST_THREAD_KEY, {}),
+  restoreUid: readJson<string | null>(LAST_GUY_KEY, null),
   view: "chat",
   fileByGuy: {},
   routineRunByGuy: {},
@@ -92,20 +98,23 @@ export const useApp = create<AppState>((set, get) => ({
   setRoster: (roster) => {
     set({ roster });
     const guys = sortGuys(roster, get().order);
-    const { selectedUid } = get();
+    const { selectedUid, restoreUid } = get();
+    if (restoreUid) {
+      if (guys.some((g) => g.uid === restoreUid)) {
+        set({ restoreUid: null });
+        return showGuy(restoreUid);
+      }
+      if (stillConnecting(roster, restoreUid)) return;
+      set({ restoreUid: null });
+    }
     if ((!selectedUid || !guys.some((g) => g.uid === selectedUid)) && guys.length) {
-      get().selectGuy(guys[0].uid);
+      showGuy(guys[0].uid);
     }
   },
   selectGuy: (uid, sessionKey) => {
-    // Routine runs live in the Routines tab, not in the chats.
-    const last = get().lastThreadByGuy[uid];
-    const remembered = last && threadKind(last) !== "routine" ? last : undefined;
-    const gatewayId = uid.slice(0, uid.indexOf("/"));
-    const agentId = uid.slice(uid.indexOf("/") + 1);
-    const key = sessionKey ?? remembered ?? defaultThread(get().roster, { gatewayId, id: agentId });
-    set({ selectedUid: uid, selectedSessionKey: key });
-    get().selectSession(key);
+    localStorage.setItem(LAST_GUY_KEY, JSON.stringify(uid));
+    set({ restoreUid: null });
+    showGuy(uid, sessionKey);
   },
   selectSession: (key) => {
     if (key && threadKind(key) === "routine") return get().selectRoutineRun(key);
@@ -162,6 +171,27 @@ export const useApp = create<AppState>((set, get) => ({
   },
 }));
 
+/** Show a guy (and their last thread) without making them the one to reopen. */
+function showGuy(uid: string, sessionKey?: string | null) {
+  const { lastThreadByGuy, roster, selectSession } = useApp.getState();
+  // Routine runs live in the Routines tab, not in the chats.
+  const last = lastThreadByGuy[uid];
+  const remembered = last && threadKind(last) !== "routine" ? last : undefined;
+  const gatewayId = uid.slice(0, uid.indexOf("/"));
+  const agentId = uid.slice(uid.indexOf("/") + 1);
+  const key = sessionKey ?? remembered ?? defaultThread(roster, { gatewayId, id: agentId });
+  useApp.setState({ selectedUid: uid, selectedSessionKey: key });
+  selectSession(key);
+}
+
+/** Could this guy still show up (their gateway is on its way up)? */
+function stillConnecting(roster: Roster, uid: string): boolean {
+  const g = roster.gateways.find((g) => g.id === uid.slice(0, uid.indexOf("/")));
+  if (!g?.enabled || roster.hidden.includes(uid)) return false;
+  const { phase } = g.status;
+  return phase === "starting" || phase === "connecting" || (phase === "connected" && !g.loaded);
+}
+
 export function mainSessionKey(agentId: string): string {
   return `agent:${agentId}:main`;
 }
@@ -200,4 +230,10 @@ export async function connectAppStore() {
   const { setStatus, setRoster } = useApp.getState();
   await Promise.all([listen<ConnStatus>("gw:status", setStatus), listen<Roster>("lg:roster", setRoster)]);
   setRoster(await core.roster());
+  // Don't wait forever on a gateway that's slow to come up.
+  setTimeout(() => {
+    if (!useApp.getState().restoreUid) return;
+    useApp.setState({ restoreUid: null });
+    setRoster(useApp.getState().roster);
+  }, RESTORE_WAIT_MS);
 }
