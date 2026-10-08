@@ -116,9 +116,31 @@ export function channelName(key: string): string | null {
   return parts[2].replace(/-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, "");
 }
 
-export function threadTitle(row: Pick<SessionRow, "key" | "label" | "displayName" | "derivedTitle">): string {
+/**
+ * OpenClaw (and Hermes, via its "Bot Chat") give every guy a real main chat.
+ * ACP agents only have threads: their `agent:<id>:main` key is just a draft
+ * that becomes a thread on the first message.
+ */
+export function hasMainChat(roster: Roster, gatewayId: string): boolean {
+  return gatewayOf(roster, gatewayId)?.status.kind !== "acp";
+}
+
+/** Where to land for a guy: their main chat, or (ACP) their latest thread / a new draft. */
+export function defaultThread(roster: Roster, guy: Pick<Guy, "gatewayId" | "id">): string {
+  const main = `agent:${guy.id}:main`;
+  if (hasMainChat(roster, guy.gatewayId)) return main;
+  const latest = sessionsFor(roster, guy)
+    .filter((r) => !r.archived && ["main", "chat", "channel"].includes(threadKind(r.key)))
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0];
+  return latest?.key ?? main;
+}
+
+export function threadTitle(
+  row: Pick<SessionRow, "key" | "label" | "displayName" | "derivedTitle"> & { updatedAt?: number | null },
+  mainChat = true,
+): string {
   const kind = threadKind(row.key);
-  if (kind === "main") return row.label || "Main chat";
+  if (kind === "main" && mainChat) return row.label || "Main chat";
   const title = row.label || row.derivedTitle || row.displayName;
   if (title) return title;
   if (kind === "channel") {
@@ -126,7 +148,7 @@ export function threadTitle(row: Pick<SessionRow, "key" | "label" | "displayName
     return ch ? `${ch[0].toUpperCase()}${ch.slice(1)} conversation` : "Conversation";
   }
   if (kind === "routine") return "Routine run";
-  return "New chat";
+  return row.updatedAt ? "Untitled chat" : "New chat";
 }
 
 function agentIdOf(key: string): string | null {

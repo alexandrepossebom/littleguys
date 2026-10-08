@@ -1,7 +1,7 @@
 import { ArrowDown, Globe, RotateCw } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { sessions as sessionsApi } from "../lib/gateway";
-import { channelName, gatewayOf, guyName, isRunning, phaseLabel, sessionRow, threadKind, threadTitle } from "../lib/guys";
+import { channelName, gatewayOf, guyName, hasMainChat, isRunning, phaseLabel, sessionRow, threadKind, threadTitle } from "../lib/guys";
 import { core } from "../lib/ipc";
 import { presentTense, toolKind } from "../lib/toolPhrases";
 import type { Guy } from "../lib/types";
@@ -62,7 +62,9 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
   }, []);
 
   const kind = threadKind(sessionKey);
-  const title = row ? threadTitle(row) : kind === "main" ? "Main chat" : "Chat";
+  const mainChat = useApp((s) => hasMainChat(s.roster, gw));
+  const isMain = kind === "main" && mainChat;
+  const title = row ? threadTitle(row, mainChat) : isMain ? "Main chat" : kind === "main" ? "New chat" : "Chat";
   // The tool call in flight, if any: drives the header's status line and the browser button.
   const activeTool = useMemo(() => {
     if (!running) return null;
@@ -118,7 +120,7 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
               {kind === "routine" ? "Nothing from this run yet" : `Say hi to ${guyName(agent)}`}
             </p>
             <p className="mt-1 max-w-xs text-[12.5px] text-[var(--color-ink-3)]">
-              {kind === "main"
+              {isMain
                 ? "This is your main chat. Ask for anything — research, errands on the web, files, reminders."
                 : kind === "routine"
                   ? `${guyName(agent)}'s messages for this run show up here as they work.`
@@ -190,7 +192,8 @@ function ChatHeader({
   const channel = kind === "channel" ? channelName(sessionKey) : null;
   const channelLabel = channel ? channel.charAt(0).toUpperCase() + channel.slice(1) : null;
   // The main chat is just "talking to Jefe"; other threads say which one this is.
-  const threadLabel = kind === "main" ? null : kind === "channel" ? `${title} on ${channelLabel}` : title;
+  const isMain = kind === "main" && gateway?.status.kind !== "acp";
+  const threadLabel = isMain ? null : kind === "channel" ? `${title} on ${channelLabel}` : title;
 
   return (
     <div data-tauri-drag-region className="flex h-14 shrink-0 items-center gap-3 border-b border-[var(--color-line)] px-5">

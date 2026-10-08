@@ -1,7 +1,7 @@
 import { CalendarClock, ChevronRight, Pencil, Play, Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { cron } from "../lib/gateway";
-import { capsOf, guyName, relativeTime, sessionsFor, threadKind, threadTitle } from "../lib/guys";
+import { capsOf, guyName, hasMainChat, relativeTime, sessionsFor, threadKind, threadTitle } from "../lib/guys";
 import { errorMessage, listen } from "../lib/ipc";
 import {
   DAYS,
@@ -317,6 +317,8 @@ function RoutineEditor({ guy, job, onClose, onSaved }: { guy: Guy; job: Job | nu
   const threads = useMemo(() => {
     const rows = sessionsFor(roster, guy).filter((r) => ["main", "chat"].includes(threadKind(r.key)));
     const main = mainSessionKey(agentId);
+    // ACP agents have no main chat; only their real threads can receive runs.
+    if (!hasMainChat(roster, guy.gatewayId)) return rows.map((r) => ({ key: r.key, title: threadTitle(r, false) }));
     return [{ key: main, title: "Main chat" }, ...rows.filter((r) => r.key !== main).map((r) => ({ key: r.key, title: threadTitle(r) }))];
   }, [roster, guy, agentId]);
 

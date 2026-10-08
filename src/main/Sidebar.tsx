@@ -13,6 +13,7 @@ import {
   RUNTIME_LABEL,
   sessionsFor,
   shortTime,
+  hasMainChat,
   threadKind,
   threadTitle,
 } from "../lib/guys";
@@ -126,16 +127,24 @@ function ThreadList({ guy }: { guy: Guy }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ routine: true, helper: true });
   const [creating, setCreating] = useState(false);
 
+  const withMain = hasMainChat(roster, guy.gatewayId);
   const groups = useMemo<Group[]>(() => {
     const rows = sessionsFor(roster, guy).filter((r) => !r.archived);
     const byActivity = (a: SessionRow, b: SessionRow) =>
       Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+    if (!withMain) {
+      // ACP agents have no main chat: just their threads, plus the draft while it's open.
+      const all = rows.filter((r) => ["main", "chat", "channel"].includes(threadKind(r.key))).sort(byActivity);
+      const draftKey = mainSessionKey(guy.id);
+      const draft = selected === draftKey && !all.some((r) => r.key === draftKey) ? [{ key: draftKey, kind: "direct", updatedAt: null } as SessionRow] : [];
+      return [{ id: "threads", title: "", rows: [...draft, ...all], collapsible: false }];
+    }
     const main = rows.find((r) => threadKind(r.key) === "main");
     // Channel conversations sit alongside app chats; ThreadRow badges them with their channel.
     const threads = rows.filter((r) => ["chat", "channel"].includes(threadKind(r.key))).sort(byActivity);
     const mainRow: SessionRow = main ?? ({ key: mainSessionKey(guy.id), kind: "direct", updatedAt: null } as SessionRow);
     return [{ id: "threads", title: "", rows: [mainRow, ...threads], collapsible: false }];
-  }, [roster, guy]);
+  }, [roster, guy, withMain, selected]);
 
   const newThread = useCallback(async () => {
     if (creating || !caps.newThreads) return;
@@ -182,6 +191,7 @@ function ThreadList({ guy }: { guy: Guy }) {
               g.rows.map((row) => (
                 <ThreadRow
                   key={row.key}
+                  mainChat={withMain}
                   actions={caps.threadActions}
                   gatewayId={guy.gatewayId}
                   agentId={guy.id}
@@ -236,6 +246,7 @@ function RoutineRunList({ guy }: { guy: Guy }) {
           runs.map((row) => (
             <ThreadRow
               key={row.key}
+              mainChat
               actions={caps.threadActions}
               gatewayId={guy.gatewayId}
               agentId={guy.id}
@@ -252,6 +263,7 @@ function RoutineRunList({ guy }: { guy: Guy }) {
 }
 
 function ThreadRow({
+  mainChat,
   actions,
   gatewayId,
   agentId,
@@ -260,6 +272,8 @@ function ThreadRow({
   selected,
   onSelect,
 }: {
+  /** The runtime has a real main chat (not ACP). */
+  mainChat: boolean;
   actions: boolean;
   gatewayId: string;
   agentId: string;
@@ -269,10 +283,12 @@ function ThreadRow({
   onSelect: () => void;
 }) {
   const kind = threadKind(row.key);
+  const isMain = kind === "main" && mainChat;
+  const isDraft = kind === "main" && !mainChat && !row.updatedAt;
   const [menu, setMenu] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const preview = cleanPreview(row.lastMessagePreview);
-  const title = threadTitle(row);
+  const title = threadTitle(row, mainChat);
   const channel = kind === "channel" ? channelName(row.key) : null;
 
   return (
@@ -282,7 +298,7 @@ function ThreadRow({
       onClick={onSelect}
       onKeyDown={(e) => e.key === "Enter" && onSelect()}
       onContextMenu={(e) => {
-        if (kind === "main" || !actions) return;
+        if (isMain || isDraft || !actions) return;
         e.preventDefault();
         setMenu(true);
       }}
@@ -292,7 +308,7 @@ function ThreadRow({
     >
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-1.5">
-          {row.pinned && kind !== "main" && <Pin size={10} className="shrink-0 self-center opacity-60" />}
+          {row.pinned && !isMain && <Pin size={10} className="shrink-0 self-center opacity-60" />}
           {renaming ? (
             <RenameInput gatewayId={gatewayId} row={row} onDone={() => setRenaming(false)} />
           ) : (
@@ -313,12 +329,12 @@ function ThreadRow({
             </span>
           )}
           <p className={`truncate text-[12px] ${selected ? "text-white/80" : "text-[var(--color-ink-3)]"}`}>
-            {running ? "working…" : preview || (kind === "main" ? "Your main chat" : "No messages yet")}
+            {running ? "working…" : preview || (isMain ? "Your main chat" : isDraft ? "Say hi to start a thread" : "No messages yet")}
           </p>
           {row.unread && !selected && <span className="ml-auto h-2 w-2 shrink-0 rounded-full bg-[var(--color-accent)]" />}
         </div>
       </div>
-      {kind !== "main" && actions && (
+      {!isMain && !isDraft && actions && (
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -334,6 +350,7 @@ function ThreadRow({
       )}
       {menu && (
         <ThreadMenu
+          deletable={!isMain}
           gatewayId={gatewayId}
           agentId={agentId}
           row={row}
@@ -373,12 +390,14 @@ function RenameInput({ gatewayId, row, onDone }: { gatewayId: string; row: Sessi
 }
 
 function ThreadMenu({
+  deletable,
   gatewayId,
   agentId,
   row,
   onClose,
   onRename,
 }: {
+  deletable: boolean;
   gatewayId: string;
   agentId: string;
   row: SessionRow;
@@ -430,7 +449,7 @@ function ThreadMenu({
           })
         }
       />
-      {(kind === "chat" || kind === "routine") && (
+      {(kind === "chat" || kind === "routine" || (kind === "main" && deletable)) && (
         <MenuButton
           icon={<Trash2 size={13} />}
           label="Delete"

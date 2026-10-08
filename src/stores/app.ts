@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { create } from "zustand";
-import { allGuys, findGuy, guyName, guyUid, liveGateways, threadKind } from "../lib/guys";
+import { allGuys, defaultThread, findGuy, guyName, guyUid, liveGateways, threadKind } from "../lib/guys";
 import { core, listen } from "../lib/ipc";
 import type { ConnStatus, Guy, Navigate, Roster } from "../lib/types";
 
@@ -101,8 +101,9 @@ export const useApp = create<AppState>((set, get) => ({
     // Routine runs live in the Routines tab, not in the chats.
     const last = get().lastThreadByGuy[uid];
     const remembered = last && threadKind(last) !== "routine" ? last : undefined;
+    const gatewayId = uid.slice(0, uid.indexOf("/"));
     const agentId = uid.slice(uid.indexOf("/") + 1);
-    const key = sessionKey ?? remembered ?? mainSessionKey(agentId);
+    const key = sessionKey ?? remembered ?? defaultThread(get().roster, { gatewayId, id: agentId });
     set({ selectedUid: uid, selectedSessionKey: key });
     get().selectSession(key);
   },

@@ -1,10 +1,10 @@
 import { CornerDownLeft, MessageCircleReply, Plus, Power, Settings } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { chat as chatApi } from "../lib/gateway";
-import { activityFor, cleanPreview, guyName, isMultiGateway, liveGateways, phaseLabel, threadKind } from "../lib/guys";
+import { activityFor, cleanPreview, defaultThread, guyName, isMultiGateway, liveGateways, phaseLabel, threadKind } from "../lib/guys";
 import { core, errorMessage, listen } from "../lib/ipc";
 import type { GatewayRoster, Guy, Roster } from "../lib/types";
-import { mainSessionKey, sortGuys, useApp } from "../stores/app";
+import { sortGuys, useApp } from "../stores/app";
 import { Avatar, GuyMark } from "../ui/Avatar";
 import { Spinner, TypingDots } from "../ui/kit";
 
@@ -154,7 +154,7 @@ function GuyRow({ guy, roster, replying, onReply }: { guy: Guy; roster: Roster; 
   const act = activityFor(roster, guy);
   const ring = act.needsYou ? "needs-you" : act.running ? "working" : act.unread ? "unread" : "idle";
   const preview = cleanPreview(act.latest?.lastMessagePreview);
-  const target = act.latest && threadKind(act.latest.key) !== "routine" ? act.latest.key : mainSessionKey(guy.id);
+  const target = act.latest && threadKind(act.latest.key) !== "routine" ? act.latest.key : defaultThread(roster, guy);
 
   return (
     <div className={`group rounded-xl transition ${replying ? "bg-[var(--color-chip)]" : "hover:bg-[var(--color-chip)]"}`}>
