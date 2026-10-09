@@ -10,6 +10,7 @@ import type {
   CronRunLogEntry,
   McpServer,
   ModelChoice,
+  PastSession,
   PluginEntry,
   SessionRow,
   SkillEntry,
@@ -61,6 +62,11 @@ export const sessions = {
       ...(expectedSessionId ? { expectedSessionId } : {}),
     }),
   subscribeMessages: (gw: string, key: string) => gwCall<{ subscribed: boolean }>(gw, "sessions.messages.subscribe", { key }),
+  /** Every session the agent can resume, from every folder, newest first (ACP). */
+  past: (gw: string) => gwCall<{ sessions: PastSession[] }>(gw, "sessions.past", {}, 60_000),
+  /** Make a past session a thread that works in its own folder; resolves to its key. */
+  open: (gw: string, s: Pick<PastSession, "sessionId" | "cwd" | "title" | "updatedAt">) =>
+    gwCall<{ key: string }>(gw, "sessions.open", s),
 };
 
 export interface ChatHistory {

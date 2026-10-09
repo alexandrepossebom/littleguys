@@ -52,6 +52,8 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(180);
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TTL: Duration = Duration::from_secs(30);
 const LIST_MAX_PAGES: usize = 5;
+/// Listing every folder's sessions reads the start and end of each transcript.
+const PAST_TIMEOUT: Duration = Duration::from_secs(45);
 const STDERR_LINES: usize = 60;
 const MAX_TOOL_OUTPUT: usize = 20_000;
 const MAX_HIDDEN: usize = 500;
@@ -85,7 +87,7 @@ impl AcpClient {
             gateway_id: id.clone(),
             gateway_name: name.clone(),
             kind: RuntimeKind::Acp,
-            capabilities: capabilities(false, config.transport == AcpTransport::Stdio),
+            capabilities: capabilities(false, config.transport == AcpTransport::Stdio, false),
             mode: Some(transport_mode(&config)),
             url: Some(describe_endpoint(&config)),
             config_path: dir.display().to_string(),
@@ -191,7 +193,8 @@ impl AcpClient {
 }
 
 /// `local`: the agent runs on this Mac (stdio), so its folders can be read directly.
-fn capabilities(attachments: bool, local: bool) -> Capabilities {
+/// `past`: it lists sessions (`session/list`) and replays them (`session/load`).
+fn capabilities(attachments: bool, local: bool, past: bool) -> Capabilities {
     Capabilities {
         manage_guys: false,
         routines: true,
@@ -207,6 +210,7 @@ fn capabilities(attachments: bool, local: bool) -> Capabilities {
         tools: false,
         plugins: local,
         browser: false,
+        past_sessions: past,
     }
 }
 
@@ -684,6 +688,7 @@ async fn handshake(inner: &Arc<Inner>, conn: &Arc<Conn>) -> Result<(), Outcome> 
         "agentCapabilities": agent.caps,
         "authMethods": agent.auth_methods,
     });
+    let past = agent.session_cap("list") && agent.load_session();
     *inner.agent.lock().unwrap() = agent;
     inner.live.lock().unwrap().clear();
     inner.tried_auth.store(false, Ordering::SeqCst);
@@ -695,7 +700,7 @@ async fn handshake(inner: &Arc<Inner>, conn: &Arc<Conn>) -> Result<(), Outcome> 
         s.phase = if auth_missing { Phase::AuthFailed } else { Phase::Connected };
         s.message = auth_missing.then_some(hint);
         s.server_version = server_version;
-        s.capabilities = capabilities(image, inner.config.transport == AcpTransport::Stdio);
+        s.capabilities = capabilities(image, inner.config.transport == AcpTransport::Stdio, past);
         s.hello = Some(hello);
         s.retry_at_ms = None;
     });
@@ -1419,6 +1424,8 @@ impl Inner {
                 Ok(json!({ "subscribed": true }))
             }
             "sessions.create" => self.sessions_create(&params).await,
+            "sessions.past" => self.sessions_past().await,
+            "sessions.open" => self.sessions_open(&params),
             "sessions.patch" => self.sessions_patch(&params),
             "sessions.delete" => self.sessions_delete(&params).await,
             "chat.history" => self.chat_history(&params).await,
@@ -1527,6 +1534,96 @@ impl Inner {
         }
         *self.list_cache.lock().unwrap() = Some((Instant::now(), out.clone()));
         out
+    }
+
+    /// Every session the agent can resume, from every folder, newest first (the
+    /// resume picker). `inThreads`: already in the thread list.
+    async fn sessions_past(self: &Arc<Self>) -> Result<Value, RpcError> {
+        if !self.agent().session_cap("list") {
+            return Ok(json!({ "sessions": [] }));
+        }
+        let conn = self.require_conn().map_err(|e| e.to_rpc())?;
+        let mut listed = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..LIST_MAX_PAGES {
+            // No `cwd`: every folder.
+            let params = cursor.as_ref().map_or_else(|| json!({}), |c| json!({ "cursor": c }));
+            let result = conn.request("session/list", params, Some(PAST_TIMEOUT)).await.map_err(|e| self.rpc_error(&e))?;
+            let page = result.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default();
+            let n = page.len();
+            listed.extend(page);
+            cursor = result.get("nextCursor").and_then(Value::as_str).map(str::to_string);
+            if n == 0 || cursor.is_none() {
+                break;
+            }
+        }
+        let guy_cwd = self.cwd_string();
+        let store = self.store.lock().unwrap();
+        let hidden: HashSet<&str> = store.index.hidden.iter().map(String::as_str).collect();
+        let mut threads: HashMap<String, String> = HashMap::new();
+        for meta in &store.index.sessions {
+            for sid in meta.session_id.iter().chain(&meta.aliases).cloned().chain(implied_session_id(&meta.key)) {
+                threads.insert(sid, meta.key.clone());
+            }
+        }
+        let rows: Vec<Value> = listed
+            .iter()
+            .filter_map(|info| {
+                let sid = info.get("sessionId").and_then(Value::as_str)?;
+                if hidden.contains(sid) {
+                    return None;
+                }
+                let cwd = info.get("cwd").and_then(Value::as_str).unwrap_or(&guy_cwd);
+                let key = threads.get(sid).cloned();
+                Some(json!({
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "title": info.get("title").and_then(Value::as_str),
+                    "updatedAt": info.get("updatedAt").and_then(Value::as_str).and_then(parse_iso_ms),
+                    // Sessions in the guy's own folder are listed with the threads already.
+                    "inThreads": key.is_some() || same_dir(cwd, &guy_cwd),
+                    "key": key.unwrap_or_else(|| keys::thread(AGENT_ID, sid)),
+                }))
+            })
+            .collect();
+        Ok(json!({ "sessions": rows }))
+    }
+
+    /// A session from the resume picker, as a thread that works in the session's own folder.
+    fn sessions_open(&self, params: &Value) -> Result<Value, RpcError> {
+        let sid = param_str(params, &["sessionId"]).map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| bad_request("sessionId is required"))?;
+        let guy_cwd = self.cwd_string();
+        let known = |m: &SessionMeta| {
+            m.session_id.as_deref() == Some(sid) || m.aliases.iter().any(|a| a == sid) || implied_session_id(&m.key).as_deref() == Some(sid)
+        };
+        if let Some(meta) = self.store.lock().unwrap().index.sessions.iter().find(|m| known(m)) {
+            return Ok(json!({ "key": meta.key }));
+        }
+        let cwd = match param_str(params, &["cwd"]).map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) => Some(
+                resolve_dir(c).ok_or_else(|| bad_request(&format!("This session's folder {} doesn't exist anymore.", resolve_path(c).display())))?,
+            ),
+            None => None,
+        };
+        let own = cwd.map(|p| p.display().to_string()).filter(|c| !same_dir(c, &guy_cwd));
+        let title = param_str(params, &["title"]).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        let updated = params.get("updatedAt").and_then(Value::as_u64).unwrap_or_else(now_ms);
+        let key = keys::thread(AGENT_ID, sid);
+        let mut store = self.store.lock().unwrap();
+        if !store.index.sessions.iter().any(|m| known(m)) {
+            store.index.sessions.push(SessionMeta {
+                key: key.clone(),
+                session_id: Some(sid.to_string()),
+                title_from_agent: title.is_some(),
+                title,
+                cwd: own,
+                created_at: updated,
+                updated_at: updated,
+                ..Default::default()
+            });
+            store.save();
+        }
+        Ok(json!({ "key": key }))
     }
 
     /// Title/updatedAt the agent reported for a session we haven't indexed.
@@ -2148,6 +2245,12 @@ fn listed_row(info: &Value, cwd: &str) -> Value {
         "hasActiveRun": false,
         "status": "done",
     })
+}
+
+/// The same folder, however it's spelled (trailing slash, symlinks).
+fn same_dir(a: &str, b: &str) -> bool {
+    let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p.trim_end_matches('/')));
+    a.trim_end_matches('/') == b.trim_end_matches('/') || canonical(a) == canonical(b)
 }
 
 fn parse_iso_ms(s: &str) -> Option<u64> {
@@ -4540,5 +4643,13 @@ enabled = false
         assert_eq!(resolve_path("/abs"), PathBuf::from("/abs"));
         assert_eq!(resolve_dir("/"), Some(PathBuf::from("/")));
         assert_eq!(resolve_dir("/definitely/not/here"), None);
+    }
+
+    #[test]
+    fn same_folder_however_spelled() {
+        assert!(same_dir("/Users/x/dev/", "/Users/x/dev"));
+        assert!(same_dir("/tmp", "/private/tmp"));
+        assert!(!same_dir("/tmp", "/usr"));
+        assert!(!same_dir("/Users/x/dev", "/Users/x/dev2"));
     }
 }

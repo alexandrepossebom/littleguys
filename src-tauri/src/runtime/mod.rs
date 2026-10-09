@@ -28,6 +28,9 @@
 //!   required?, choices?:[{value,label}]}]}]}` (if `commands`; `name` has no leading `/`, `acceptsArgs` absent =
 //!   unknown). `chat.send` with `/name args` runs one; a command that answers without a turn returns
 //!   `status:"ok"` instead of `"started"` (its output arrives as `session.message`).
+//! - `sessions.past` → `{sessions:[{sessionId, cwd, title?, updatedAt?, key, inThreads}]}`: every session the
+//!   agent can resume, from every folder, newest first; `sessions.open {sessionId, cwd?, title?, updatedAt?}` →
+//!   `{key}` makes one a thread that works in its own folder (if `pastSessions`)
 //! - `tools.effective {agentId, sessionKey}` / `tools.catalog {agentId}` → `{agentId, groups:[{id, label, source,
 //!   tools:[{id, label, description?}]}], notices?}` (if `tools`)
 //! - `plugins.list` → `{plugins:[{id, name, description?, version?, enabled, state}]}`;
@@ -104,6 +107,8 @@ pub struct Capabilities {
     pub plugins: bool,
     /// The guy's browser can be watched and driven (OpenClaw `browser.request`).
     pub browser: bool,
+    /// Past sessions from every folder can be listed and resumed (`sessions.past` / `sessions.open`).
+    pub past_sessions: bool,
 }
 
 impl Capabilities {
@@ -123,6 +128,7 @@ impl Capabilities {
             tools: true,
             plugins: true,
             browser: false,
+            past_sessions: false,
         }
     }
 

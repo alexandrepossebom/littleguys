@@ -20,7 +20,8 @@ function readJson<T>(key: string, fallback: T): T {
   }
 }
 
-export type MainView = "chat" | "routines" | "files" | "skills";
+/** What the main pane shows; "past" is the resume picker (ACP agents' sessions from every folder). */
+export type MainView = "chat" | "routines" | "files" | "skills" | "past";
 
 /** The browser panel beside the chat: open per guy, one shared width. */
 interface BrowserPanelPrefs {
@@ -69,6 +70,8 @@ interface AppState {
   selectRoutineRun(key: string | null, uid?: string): void;
   /** Pick a guy's skill or tool (and show it, unless `open` is false). */
   selectAbility(uid: string, id: string, open?: boolean): void;
+  /** Show the resume picker for a guy's past sessions. */
+  openPast(uid: string): void;
   setBrowserOpen(uid: string, open: boolean): void;
   setBrowserWidth(width: number): void;
   setOrder(order: string[]): void;
@@ -162,6 +165,10 @@ export const useApp = create<AppState>((set, get) => ({
       activate(uid);
       set({ view: "skills" });
     }
+  },
+  openPast: (uid) => {
+    activate(uid);
+    set({ view: "past" });
   },
   setBrowserOpen: (uid, open) => {
     const browser = { ...get().browser, open: { ...get().browser.open, [uid]: open } };

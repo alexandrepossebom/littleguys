@@ -431,6 +431,7 @@ fn capabilities(mode: HermesMode) -> Capabilities {
         tools: true,
         plugins: local,
         browser: false,
+        past_sessions: false,
     }
 }
 

@@ -41,6 +41,20 @@ export interface Capabilities {
   tools: boolean;
   plugins: boolean;
   browser: boolean;
+  /** Past sessions from every folder can be listed and resumed (`sessions.past` / `sessions.open`, ACP). */
+  pastSessions: boolean;
+}
+
+/** A session the agent can resume, from any folder (`sessions.past`). */
+export interface PastSession {
+  sessionId: string;
+  cwd: string;
+  title?: string | null;
+  updatedAt?: number | null;
+  /** The thread it is (or will be once opened). */
+  key: string;
+  /** Already in the thread list (opened before, or in the guy's own folder). */
+  inThreads: boolean;
 }
 
 export interface ConnStatus {

@@ -10,6 +10,7 @@ import { ChatView } from "./ChatView";
 import { Doctor } from "./Doctor";
 import { FilesView } from "./Files";
 import { GuyEditor } from "./GuyEditor";
+import { PastSessions } from "./PastSessions";
 import { RoutinesPanel } from "./Routines";
 import { Settings } from "./Settings";
 import { Sidebar } from "./Sidebar";
@@ -83,6 +84,8 @@ export function App() {
                   <FilesView key={guy.uid} guy={guy} />
                 ) : view === "skills" && (caps.skills || caps.tools || caps.plugins) ? (
                   <SkillsView key={guy.uid} guy={guy} />
+                ) : view === "past" && caps.pastSessions ? (
+                  <PastSessions key={guy.uid} guy={guy} />
                 ) : selectedSessionKey ? (
                   <div className="flex h-full min-h-0">
                     <div className="flex min-w-0 flex-1 flex-col">

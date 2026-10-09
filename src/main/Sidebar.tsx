@@ -4,6 +4,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Folder,
+  History,
   MessageCircle,
   MoreHorizontal,
   Pencil,
@@ -193,7 +194,9 @@ function ThreadList({ guy }: { guy: Guy }) {
   const caps = capsOf(roster, guy.gatewayId);
   // The thread open in the chat, if it's this guy's.
   const selected = useApp((s) => (s.selectedUid === guy.uid && s.view === "chat" ? s.selectedSessionKey : null));
+  const pastShown = useApp((s) => s.selectedUid === guy.uid && s.view === "past");
   const selectGuy = useApp((s) => s.selectGuy);
+  const openPast = useApp((s) => s.openPast);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ routine: true, helper: true });
   const [creating, setCreating] = useState(false);
 
@@ -245,6 +248,18 @@ function ThreadList({ guy }: { guy: Guy }) {
         )}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+        {caps.pastSessions && (
+          <button
+            onClick={() => openPast(guy.uid)}
+            title="Sessions from every folder on this Mac, including ones you ran in a terminal"
+            className={`mb-1 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition ${
+              pastShown ? "bg-[var(--color-accent)] text-white shadow-sm" : "text-[var(--color-ink-2)] hover:bg-[var(--color-chip)]"
+            }`}
+          >
+            <History size={14} className="shrink-0 opacity-80" />
+            <span className="font-medium">Resume a session…</span>
+          </button>
+        )}
         {groups.map((g) => (
           <div key={g.id} className="mb-1">
             {g.title && (
