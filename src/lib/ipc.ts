@@ -12,6 +12,7 @@ import type {
   Navigate,
   RegistryAgent,
   Roster,
+  UpdateState,
 } from "./types";
 
 export interface RpcError {
@@ -162,6 +163,12 @@ export const core = {
       }),
   },
   quit: () => invoke<void>("quit"),
+  updates: {
+    state: () => invoke<UpdateState>("update_state"),
+    /** Check now; downloads and installs a newer release if there is one. */
+    check: () => invoke<UpdateState>("update_check"),
+    restart: () => invoke<void>("update_restart"),
+  },
   doctor: {
     check: () => invoke<DoctorReport>("doctor_check"),
     install: (version?: string) => invoke<void>("doctor_install_openclaw", { version: version ?? null }),

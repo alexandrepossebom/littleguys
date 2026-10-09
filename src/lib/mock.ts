@@ -569,6 +569,14 @@ export const mockBackend: Backend = {
         }, 1200);
         return { id, name, url, enabled: true, addedAtMs: Date.now() } as T;
       }
+      case "update_state":
+        return { current: "0.1.0", phase: "idle", version: null, error: null, checkedAt: null } as T;
+      case "update_check": {
+        const ready = { current: "0.1.0", phase: "ready", version: "0.1.1", error: null, checkedAt: Date.now() };
+        await new Promise((r) => setTimeout(r, 800));
+        emit("lg:update", ready);
+        return ready as T;
+      }
       default:
         return undefined as T;
     }

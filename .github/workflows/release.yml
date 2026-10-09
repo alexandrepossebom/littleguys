@@ -1,0 +1,131 @@
+# Push a tag like v0.1.1 (matching the version in src-tauri/tauri.conf.json) and
+# this builds the universal app, signs it with the Developer ID certificate,
+# notarizes it, and publishes the .dmg plus the signed update bundle and
+# latest.json (what the in-app updater reads). It then bumps the cask in
+# herval/homebrew-tap.
+#
+# Secrets:
+#   APPLE_CERTIFICATE           Developer ID Application cert + key, exported as .p12, base64
+#   APPLE_CERTIFICATE_PASSWORD  the .p12's password
+#   APPLE_SIGNING_IDENTITY      e.g. "Developer ID Application: Herval Freire (TEAMID)"
+#   APPLE_ID                    Apple Account email, for notarization
+#   APPLE_PASSWORD              an app-specific password for it (account.apple.com)
+#   APPLE_TEAM_ID               the 10-character team ID
+#   TAURI_SIGNING_PRIVATE_KEY           contents of ~/.tauri/littleguys-updater.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  contents of ~/.tauri/littleguys-updater.key.password
+#   HOMEBREW_TAP_TOKEN          fine-grained token with Contents: write on herval/homebrew-tap
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches the app version
+        run: |
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in src-tauri/tauri.conf.json"
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # Builds into a draft so a failed build or notarization never leaves a
+      # half-empty release where the updater can see it.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: littleguys ${{ github.ref_name }}
+          releaseBody: "Install with `brew install herval/tap/littleguys`, or download the .dmg below. Already running littleguys? It updates itself."
+          releaseDraft: true
+          args: --target universal-apple-darwin --config src-tauri/tauri.release.conf.json
+
+      - name: Gatekeeper accepts the app
+        run: |
+          app=src-tauri/target/universal-apple-darwin/release/bundle/macos/littleguys.app
+          lipo -archs "$app/Contents/MacOS/littleguys"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          xcrun stapler validate "$app"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+
+  homebrew:
+    needs: app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fill in the cask
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          dmg="littleguys_${version}_universal.dmg"
+          gh release download "$GITHUB_REF_NAME" --pattern "$dmg" --dir "$RUNNER_TEMP"
+          sha=$(sha256sum "$RUNNER_TEMP/$dmg" | cut -d' ' -f1)
+          sed -E \
+            -e "s/^  version \".*\"/  version \"${version}\"/" \
+            -e "s/^  sha256 \".*\"/  sha256 \"${sha}\"/" \
+            -e '/^# /d' \
+            packaging/homebrew/littleguys.rb > "$RUNNER_TEMP/littleguys.rb"
+          cat "$RUNNER_TEMP/littleguys.rb"
+
+      - name: Push it to herval/homebrew-tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/herval/homebrew-tap.git" "$RUNNER_TEMP/tap"
+          cd "$RUNNER_TEMP/tap"
+          mkdir -p Casks
+          cp "$RUNNER_TEMP/littleguys.rb" Casks/littleguys.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/littleguys.rb
+          git diff --cached --quiet && { echo "Cask already up to date"; exit 0; }
+          git commit -m "littleguys ${GITHUB_REF_NAME#v}"
+          git push

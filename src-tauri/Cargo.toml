@@ -3,6 +3,8 @@ name = "littleguys"
 version = "0.1.0"
 description = "A little guy in your menu bar, running your OpenClaw agents"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/herval/littleguys"
 
 [lib]
 name = "littleguys_lib"
@@ -20,6 +22,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
 window-vibrancy = "0.6"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }

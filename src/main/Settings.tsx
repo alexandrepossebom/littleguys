@@ -1,8 +1,8 @@
 import { Pencil, Plus, RotateCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { phaseLabel, RUNTIME_LABEL } from "../lib/guys";
-import { core, errorMessage, isTauri } from "../lib/ipc";
-import type { GatewayRoster } from "../lib/types";
+import { core, errorMessage, isTauri, listen } from "../lib/ipc";
+import type { GatewayRoster, UpdateState } from "../lib/types";
 import { useApp } from "../stores/app";
 import { GuyMark } from "../ui/Avatar";
 import { confirmAction } from "../ui/confirm";
@@ -70,6 +70,7 @@ export function Settings() {
             <Row label="Open littleguys">
               <kbd className="rounded bg-[var(--color-chip)] px-1.5 py-0.5 text-[11px]">⇧⌘L</kbd>
             </Row>
+            <UpdateRow />
           </div>
         </section>
 
@@ -202,6 +203,47 @@ function GatewayRow({ gateway: g }: { gateway: GatewayRoster }) {
       )}
       {error && <p className="mt-2 text-[11.5px] text-[var(--color-bad)]">{error}</p>}
     </div>
+  );
+}
+
+function UpdateRow() {
+  const [update, setUpdate] = useState<UpdateState | null>(null);
+
+  useEffect(() => {
+    core.updates.state().then(setUpdate).catch(() => {});
+    const off = listen<UpdateState>("lg:update", setUpdate);
+    return () => void off.then((f) => f());
+  }, []);
+
+  if (!update) return null;
+  const check = () => core.updates.check().then(setUpdate).catch(() => {});
+  return (
+    <Row label={`Version ${update.current}`}>
+      {update.phase === "ready" ? (
+        <Button size="sm" variant="primary" onClick={() => core.updates.restart()}>
+          Restart to update to {update.version}
+        </Button>
+      ) : update.phase === "downloading" ? (
+        <span className="text-[var(--color-ink-3)]">Downloading {update.version}…</span>
+      ) : update.phase === "checking" ? (
+        <span className="text-[var(--color-ink-3)]">Checking for updates…</span>
+      ) : update.phase === "disabled" ? (
+        <span className="text-[var(--color-ink-3)]">Dev build: no updates</span>
+      ) : (
+        <span className="flex items-center gap-2">
+          {update.phase === "error" ? (
+            <span className="truncate text-[var(--color-bad)]" title={update.error ?? undefined}>
+              Couldn't check
+            </span>
+          ) : (
+            update.checkedAt && <span className="text-[var(--color-ink-3)]">Up to date</span>
+          )}
+          <Button size="sm" variant="ghost" onClick={check}>
+            Check for updates
+          </Button>
+        </span>
+      )}
+    </Row>
   );
 }
 

@@ -190,6 +190,15 @@ export interface Navigate {
   view?: string | null;
 }
 
+/** Self-update from GitHub releases (src-tauri/src/updater.rs); pushed as `lg:update`. */
+export interface UpdateState {
+  current: string;
+  phase: "idle" | "checking" | "downloading" | "ready" | "error" | "disabled";
+  version: string | null;
+  error: string | null;
+  checkedAt: number | null;
+}
+
 /** A transcript message as returned by chat.history / chat events. */
 export interface ChatMessage {
   role: "user" | "assistant" | "toolResult" | "system" | string;

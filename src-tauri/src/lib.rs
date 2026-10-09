@@ -10,10 +10,9 @@ mod media;
 pub mod openclaw;
 pub mod runtime;
 mod tray;
+mod updater;
 mod windows;
 
-
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, RunEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -21,6 +20,7 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 use crate::activity::Activity;
 use crate::hub::Hub;
 use crate::tray::TrayAnimator;
+use crate::updater::Updates;
 
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("littleguys_lib=info")).init();
@@ -37,6 +37,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
@@ -73,6 +74,9 @@ pub fn run() {
             media::gw_media,
             media::save_media,
             commands::quit,
+            commands::update_state,
+            commands::update_check,
+            commands::update_restart,
             doctor::doctor_check,
             doctor::doctor_install_openclaw,
             doctor::doctor_update_openclaw,
@@ -90,14 +94,7 @@ pub fn run() {
 
             // Menu-bar guy
             let animator = TrayAnimator::new();
-            let menu = Menu::with_items(
-                app,
-                &[
-                    &MenuItem::with_id(app, "open", "Open littleguys", true, Some("CmdOrCtrl+Shift+L"))?,
-                    &PredefinedMenuItem::separator(app)?,
-                    &MenuItem::with_id(app, "quit", "Quit littleguys", true, Some("CmdOrCtrl+Q"))?,
-                ],
-            )?;
+            let menu = tray::menu(&handle, None)?;
             TrayIconBuilder::with_id(tray::TRAY_ID)
                 .icon(tray::first_frame())
                 .icon_as_template(true)
@@ -107,6 +104,7 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "open" => windows::open_main(app, None),
                     "quit" => app.exit(0),
+                    "restart-update" => app.restart(),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -119,6 +117,11 @@ pub fn run() {
             animator.start(handle.clone());
 
             windows::setup(&handle);
+
+            // Self-update from GitHub releases
+            let updates = Updates::new(app.package_info().version.to_string());
+            updater::start(handle.clone(), updates.clone(), animator.clone());
+            app.manage(updates);
 
             // Gateway connections + roster
             let activity = Activity::new(handle.clone(), animator);

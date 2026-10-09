@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tauri::image::Image;
-use tauri::AppHandle;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::{AppHandle, Wry};
 use tokio::sync::Notify;
 
 pub const TRAY_ID: &str = "littleguys";
@@ -60,6 +61,26 @@ fn schedule(mood: Mood) -> &'static [(&'static str, u64)] {
     }
 }
 
+/// The right-click menu. Once an update is installed, it offers the restart.
+pub fn menu(app: &AppHandle, update: Option<&str>) -> tauri::Result<Menu<Wry>> {
+    let open = MenuItem::with_id(app, "open", "Open littleguys", true, Some("CmdOrCtrl+Shift+L"))?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit littleguys", true, Some("CmdOrCtrl+Q"))?;
+    match update {
+        Some(version) => {
+            let restart = MenuItem::with_id(app, "restart-update", format!("Restart to Update to {version}"), true, None::<&str>)?;
+            Menu::with_items(app, &[&open, &restart, &separator, &quit])
+        }
+        None => Menu::with_items(app, &[&open, &separator, &quit]),
+    }
+}
+
+pub fn set_update_ready(app: &AppHandle, version: &str) {
+    if let (Some(tray), Ok(menu)) = (app.tray_by_id(TRAY_ID), menu(app, Some(version))) {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
 pub fn first_frame() -> Image<'static> {
     Image::from_bytes(FRAMES[0].1).expect("tray frame decodes")
 }
@@ -73,6 +94,10 @@ pub struct TrayAnimator {
 impl TrayAnimator {
     pub fn new() -> Self {
         Self { mood: Arc::new(Mutex::new(Mood::Setup)), changed: Arc::new(Notify::new()) }
+    }
+
+    pub fn mood(&self) -> Mood {
+        *self.mood.lock().unwrap()
     }
 
     pub fn set_mood(&self, mood: Mood) {

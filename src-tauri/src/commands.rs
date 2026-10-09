@@ -9,6 +9,7 @@ use crate::activity::{Activity, Roster};
 use crate::gateway::client::{ConnStatus, RpcError};
 use crate::gateways::{AcpConfig, GatewayEntry, HermesConfig};
 use crate::runtime::RuntimeKind;
+use crate::updater::{UpdateState, Updates};
 use crate::hub::{DiscoveredGateway, Hub};
 use crate::openclaw::config::Credential;
 use crate::windows::{self, Navigate};
@@ -199,4 +200,21 @@ pub fn reveal_path(path: String) -> Result<(), String> {
 #[tauri::command]
 pub fn quit(app: AppHandle) {
     app.exit(0);
+}
+
+#[tauri::command]
+pub fn update_state(updates: State<'_, Arc<Updates>>) -> UpdateState {
+    updates.state()
+}
+
+/// Check for an update now (and install it if there is one).
+#[tauri::command]
+pub async fn update_check(app: AppHandle, updates: State<'_, Arc<Updates>>) -> Result<UpdateState, ()> {
+    Ok(updates.check(&app).await)
+}
+
+/// Relaunch into an installed update.
+#[tauri::command]
+pub fn update_restart(app: AppHandle) {
+    app.restart();
 }
