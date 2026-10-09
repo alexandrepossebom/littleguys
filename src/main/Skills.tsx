@@ -70,17 +70,20 @@ function Tile({ ability, size = 20 }: { ability: Ability; size?: number }) {
 /** Sidebar: searchable, sectioned list. */
 export function AbilityList({ guy }: { guy: Guy }) {
   const { sections, loading, error, reload } = useGuyAbilities(guy);
-  const selected = useApp((s) => s.abilityByGuy[guy.uid]);
-  const selectAbility = useApp((s) => s.selectAbility);
+  const picked = useApp((s) => s.abilityByGuy[guy.uid]);
+  // Highlight only what's on screen.
+  const selected = useApp((s) => (s.selectedUid === guy.uid && s.view === "skills" ? s.abilityByGuy[guy.uid] : undefined));
+  const pick = useApp((s) => s.selectAbility);
+  const selectAbility = (id: string) => pick(guy.uid, id);
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ tools: true });
 
-  // Open the first thing when nothing is picked yet.
+  // Remember the first thing for when the Skills view opens (browsing doesn't open it).
   useEffect(() => {
-    if (selected || !sections) return;
+    if (picked || !sections) return;
     const first = sections.find((s) => s.items.length)?.items[0];
-    if (first) selectAbility(first.id);
-  }, [sections, selected, selectAbility]);
+    if (first) pick(guy.uid, first.id, false);
+  }, [sections, picked, pick, guy.uid]);
 
   const q = query.trim().toLowerCase();
   const filtered = useMemo(

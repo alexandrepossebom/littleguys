@@ -6,7 +6,7 @@ littleguys is a friendlier home for [OpenClaw](https://openclaw.ai) on the Mac:
 
 - **Menu bar:** each OpenClaw agent is a "little guy". The menu-bar sprite shows what they're up to: idle, working, new replies, needs you, or offline.
 - **Popover:** clicking the guy opens a dropdown listing every guy with a live status ring, a last-message preview and quick reply.
-- **Main window:** a WhatsApp-style chat app with a horizontal "stories" row of guys and threads per guy. It has streaming replies, tool-call chips, attachments, and approve/deny for commands.
+- **Main window:** a WhatsApp-style chat app. The sidebar lists every guy as a card; clicking one opens their threads. It has streaming replies, tool-call chips, attachments, and approve/deny for commands.
 - **Routines:** OpenClaw cron jobs with friendly schedules, run-now and run history. Results land in a thread.
 
 It's a UX layer over your existing `~/.openclaw`, not a separate install. New guys use the workspaces OpenClaw gives each agent, and the UI links to their folder.

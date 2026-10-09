@@ -80,8 +80,10 @@ function EntryIcon({ entry, open }: { entry: WorkspaceEntry; open?: boolean }) {
 
 /** The workspace tree, in the sidebar. Folders load as you open them. */
 export function FileTree({ guy }: { guy: Guy }) {
-  const selected = useApp((s) => s.fileByGuy[guy.uid]);
-  const selectFile = useApp((s) => s.selectFile);
+  // Highlight only what's on screen.
+  const selected = useApp((s) => (s.selectedUid === guy.uid && s.view === "files" ? s.fileByGuy[guy.uid] : undefined));
+  const pick = useApp((s) => s.selectFile);
+  const selectFile = useCallback((path: string) => pick(guy.uid, path), [pick, guy.uid]);
   const gateway = useApp((s) => gatewayOf(s.roster, guy.gatewayId));
   const [pathNote, setPathNote] = useState<string | null>(null);
   const [dirs, setDirs] = useState<Record<string, Dir>>({});
@@ -111,9 +113,10 @@ export function FileTree({ guy }: { guy: Guy }) {
       if (useApp.getState().fileByGuy[guy.uid]) return;
       const files = entries.filter((e) => e.kind === "file");
       const first = ["SOUL.md", "AGENTS.md", "CLAUDE.md", "README.md"].map((n) => files.find((f) => f.name === n)).find(Boolean) ?? files[0];
-      if (first) selectFile(first.path);
+      // Remembered for when the Files view opens; browsing doesn't open it.
+      if (first) pick(guy.uid, first.path, false);
     });
-  }, [load, guy.uid, selectFile]);
+  }, [load, guy.uid, pick]);
 
   const toggle = (path: string) => {
     const next = new Set(open);

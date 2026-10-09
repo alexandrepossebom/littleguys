@@ -1,4 +1,20 @@
-import { AlarmClock, Archive, ChevronRight, Folder, MessageCircle, MoreHorizontal, Pencil, Pin, PinOff, Sparkles, SquarePen, Trash2 } from "lucide-react";
+import {
+  AlarmClock,
+  Archive,
+  ChevronLeft,
+  ChevronRight,
+  Folder,
+  MessageCircle,
+  MoreHorizontal,
+  Pencil,
+  Pin,
+  PinOff,
+  Plus,
+  Settings as SettingsIcon,
+  Sparkles,
+  SquarePen,
+  Trash2,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { sessions as sessionsApi } from "../lib/gateway";
 import {
@@ -6,8 +22,10 @@ import {
   capsOf,
   channelName,
   cleanPreview,
+  findGuy,
   gatewayOf,
   guyName,
+  guyUid,
   isMultiGateway,
   isRunning,
   RUNTIME_LABEL,
@@ -19,18 +37,70 @@ import {
 } from "../lib/guys";
 import { core } from "../lib/ipc";
 import type { Guy, SessionRow } from "../lib/types";
-import { type MainView, mainSessionKey, useApp, useSelectedGuy } from "../stores/app";
+import { type MainView, mainSessionKey, useApp } from "../stores/app";
 import { Avatar } from "../ui/Avatar";
 import { IconButton, inputClass, TypingDots } from "../ui/kit";
 import { FileTree } from "./Files";
+import { GatewayBanner } from "./GatewayBanner";
+import { GuyList } from "./GuyList";
 import { AbilityList } from "./Skills";
 
+/** Every guy as a card; clicking one drills into their threads (like WhatsApp communities). */
 export function Sidebar() {
-  const guy = useSelectedGuy();
-  const view = useApp((s) => s.view);
-  const setView = useApp((s) => s.setView);
-  const caps = useApp((s) => capsOf(s.roster, guy?.gatewayId));
-  if (!guy) return <aside className="w-[264px] shrink-0" />;
+  const roster = useApp((s) => s.roster);
+  const browseUid = useApp((s) => s.browseUid);
+  const guy = useMemo(() => findGuy(roster, browseUid), [roster, browseUid]);
+  return (
+    <aside className="flex w-[300px] shrink-0 flex-col">
+      <SidebarTop back={Boolean(guy)} />
+      <GatewayBanner />
+      {!guy ? (
+        <div key="guys" className="animate-push-back flex min-h-0 flex-1 flex-col">
+          <h1 className="px-4 pb-2 font-display text-[22px] font-bold tracking-tight">Little guys</h1>
+          <GuyList />
+        </div>
+      ) : (
+        <GuyPane key="guy" guy={guy} />
+      )}
+    </aside>
+  );
+}
+
+/** Beside the traffic lights: back to the guys, new guy, settings. */
+function SidebarTop({ back }: { back: boolean }) {
+  const browse = useApp((s) => s.browse);
+  const startNewGuy = useApp((s) => s.startNewGuy);
+  const setSettingsOpen = useApp((s) => s.setSettingsOpen);
+  const canAdd = useApp((s) => s.roster.gateways.some((g) => g.loaded) || s.roster.gateways.length > 1);
+  return (
+    <div data-tauri-drag-region className="flex h-14 shrink-0 items-center gap-0.5 pl-[84px] pr-2">
+      {back && (
+        <button
+          onClick={() => browse(null)}
+          className="-ml-1.5 flex items-center rounded-md py-1 pl-0.5 pr-2 text-[13px] font-medium text-[var(--color-accent-strong)] transition hover:bg-[var(--color-chip)]"
+        >
+          <ChevronLeft size={17} />
+          Little guys
+        </button>
+      )}
+      <div data-tauri-drag-region className="flex-1 self-stretch" />
+      {canAdd && (
+        <IconButton label="New little guy" onClick={startNewGuy}>
+          <Plus size={16} />
+        </IconButton>
+      )}
+      <IconButton label="Settings (⌘,)" onClick={() => setSettingsOpen(true)}>
+        <SettingsIcon size={15} />
+      </IconButton>
+    </div>
+  );
+}
+
+/** One guy: who they are, then their threads, routines, files or skills. */
+function GuyPane({ guy }: { guy: Guy }) {
+  const tab = useApp((s) => s.sidebarTab);
+  const setTab = useApp((s) => s.setSidebarTab);
+  const caps = useApp((s) => capsOf(s.roster, guy.gatewayId));
   const tabs: Array<{ value: MainView; label: string; icon: React.ReactNode }> = [
     { value: "chat", label: "Chats", icon: <MessageCircle size={14} /> },
     ...(caps.routines ? [{ value: "routines" as const, label: "Routines", icon: <AlarmClock size={14} /> }] : []),
@@ -38,9 +108,9 @@ export function Sidebar() {
     ...(caps.skills || caps.tools || caps.plugins ? [{ value: "skills" as const, label: "Skills", icon: <Sparkles size={14} /> }] : []),
   ];
   // A tab the guy's runtime doesn't have falls back to its chats.
-  const current = tabs.some((t) => t.value === view) ? view : "chat";
+  const current = tabs.some((t) => t.value === tab) ? tab : "chat";
   return (
-    <aside className="flex w-[264px] shrink-0 flex-col">
+    <div className="animate-push flex min-h-0 flex-1 flex-col">
       <GuyHeader guy={guy} />
       {tabs.length > 1 && (
         <div className="flex gap-1 px-3 pb-2.5" role="tablist">
@@ -52,7 +122,7 @@ export function Sidebar() {
                 role="tab"
                 aria-selected={active}
                 title={t.label}
-                onClick={() => setView(t.value)}
+                onClick={() => setTab(t.value)}
                 className={`flex h-8 items-center justify-center gap-1.5 rounded-full text-[12.5px] font-medium transition-[flex-grow,background-color,color] duration-200 ${
                   active
                     ? "flex-[2.2] bg-[var(--color-ink)] px-3 text-[var(--color-pane-solid)]"
@@ -75,7 +145,7 @@ export function Sidebar() {
       ) : (
         <ThreadList guy={guy} />
       )}
-    </aside>
+    </div>
   );
 }
 
@@ -121,9 +191,9 @@ type Group = { id: string; title: string; rows: SessionRow[]; collapsible: boole
 function ThreadList({ guy }: { guy: Guy }) {
   const roster = useApp((s) => s.roster);
   const caps = capsOf(roster, guy.gatewayId);
-  const selected = useApp((s) => s.selectedSessionKey);
-  const view = useApp((s) => s.view);
-  const selectSession = useApp((s) => s.selectSession);
+  // The thread open in the chat, if it's this guy's.
+  const selected = useApp((s) => (s.selectedUid === guy.uid && s.view === "chat" ? s.selectedSessionKey : null));
+  const selectGuy = useApp((s) => s.selectGuy);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ routine: true, helper: true });
   const [creating, setCreating] = useState(false);
 
@@ -151,12 +221,12 @@ function ThreadList({ guy }: { guy: Guy }) {
     setCreating(true);
     try {
       const res = await sessionsApi.create(guy.gatewayId, guy.id);
-      selectSession(res.key);
+      selectGuy(guy.uid, res.key);
       core.refreshRoster(guy.gatewayId).catch(() => {});
     } finally {
       setCreating(false);
     }
-  }, [guy.gatewayId, guy.id, creating, selectSession, caps.newThreads]);
+  }, [guy.gatewayId, guy.id, guy.uid, creating, selectGuy, caps.newThreads]);
 
   useEffect(() => {
     const handler = () => newThread();
@@ -197,8 +267,8 @@ function ThreadList({ guy }: { guy: Guy }) {
                   agentId={guy.id}
                   row={row}
                   running={isRunning(roster, guy.gatewayId, row.key)}
-                  selected={view === "chat" && selected === row.key}
-                  onSelect={() => selectSession(row.key)}
+                  selected={selected === row.key}
+                  onSelect={() => selectGuy(guy.uid, row.key)}
                 />
               ))}
           </div>
@@ -213,6 +283,8 @@ function RoutineRunList({ guy }: { guy: Guy }) {
   const roster = useApp((s) => s.roster);
   const caps = capsOf(roster, guy.gatewayId);
   const run = useApp((s) => s.routineRunByGuy[guy.uid] ?? null);
+  // Highlight only what's on screen.
+  const shown = useApp((s) => s.selectedUid === guy.uid && s.view === "routines");
   const selectRoutineRun = useApp((s) => s.selectRoutineRun);
   const runs = useMemo(
     () =>
@@ -228,9 +300,9 @@ function RoutineRunList({ guy }: { guy: Guy }) {
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
         <button
-          onClick={() => selectRoutineRun(null)}
+          onClick={() => selectRoutineRun(null, guy.uid)}
           className={`mb-0.5 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition ${
-            run ? "hover:bg-[var(--color-chip)]" : "bg-[var(--color-accent)] text-white shadow-sm"
+            shown && !run ? "bg-[var(--color-accent)] text-white shadow-sm" : "hover:bg-[var(--color-chip)]"
           }`}
         >
           <AlarmClock size={14} className="shrink-0 opacity-80" />
@@ -252,8 +324,8 @@ function RoutineRunList({ guy }: { guy: Guy }) {
               agentId={guy.id}
               row={row}
               running={isRunning(roster, guy.gatewayId, row.key)}
-              selected={run === row.key}
-              onSelect={() => selectRoutineRun(row.key)}
+              selected={shown && run === row.key}
+              onSelect={() => selectRoutineRun(row.key, guy.uid)}
             />
           ))
         )}
@@ -422,7 +494,8 @@ function ThreadMenu({
   };
   const leaveIfOpen = () => {
     const s = useApp.getState();
-    if (s.selectedUid && s.routineRunByGuy[s.selectedUid] === row.key) s.selectRoutineRun(null);
+    if (s.selectedUid !== guyUid(gatewayId, agentId)) return;
+    if (s.routineRunByGuy[s.selectedUid] === row.key) s.selectRoutineRun(null);
     else if (selected === row.key) selectSession(mainSessionKey(agentId));
   };
   const kind = threadKind(row.key);

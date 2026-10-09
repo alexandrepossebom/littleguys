@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { create } from "zustand";
-import { allGuys, defaultThread, findGuy, guyName, guyUid, liveGateways, threadKind } from "../lib/guys";
+import { activityFor, allGuys, defaultThread, findGuy, guyName, guyUid, liveGateways, threadKind } from "../lib/guys";
 import { core, listen } from "../lib/ipc";
 import type { ConnStatus, Guy, Navigate, Roster } from "../lib/types";
 
@@ -30,7 +30,7 @@ interface BrowserPanelPrefs {
 
 interface AppState {
   roster: Roster;
-  /** User-chosen order of guys (uids) in the stories bar. */
+  /** User-chosen order of guys (uids) in the sidebar. */
   order: string[];
   /** Selected guy, as `${gatewayId}/${agentId}`. */
   selectedUid: string | null;
@@ -39,6 +39,13 @@ interface AppState {
   /** The guy you were on last time, reopened at launch once their gateway is up. */
   restoreUid: string | null;
   view: MainView;
+  /**
+   * The guy whose threads the sidebar shows (null = every guy). Browsing doesn't
+   * change what's open; clicking a thread, run, file or skill there does.
+   */
+  browseUid: string | null;
+  /** The sidebar's tab for the browsed guy (the main pane follows `view`). */
+  sidebarTab: MainView;
   /** Open file in the Files tab, per guy (workspace-relative path). */
   fileByGuy: Record<string, string>;
   /** Routine run open in the Routines tab, per guy (null = the routines list). */
@@ -54,10 +61,14 @@ interface AppState {
   selectGuy(uid: string, sessionKey?: string | null): void;
   selectSession(key: string | null): void;
   setView(view: MainView): void;
-  selectFile(path: string): void;
+  browse(uid: string | null): void;
+  setSidebarTab(tab: MainView): void;
+  /** Pick a guy's file (and show it, unless `open` is false). */
+  selectFile(uid: string, path: string, open?: boolean): void;
   /** Open a routine run's transcript in the Routines tab (null = back to the list). */
-  selectRoutineRun(key: string | null): void;
-  selectAbility(id: string): void;
+  selectRoutineRun(key: string | null, uid?: string): void;
+  /** Pick a guy's skill or tool (and show it, unless `open` is false). */
+  selectAbility(uid: string, id: string, open?: boolean): void;
   setBrowserOpen(uid: string, open: boolean): void;
   setBrowserWidth(width: number): void;
   setOrder(order: string[]): void;
@@ -80,6 +91,9 @@ export const useApp = create<AppState>((set, get) => ({
   lastThreadByGuy: readJson<Record<string, string>>(LAST_THREAD_KEY, {}),
   restoreUid: readJson<string | null>(LAST_GUY_KEY, null),
   view: "chat",
+  // At launch, the sidebar opens on the guy you were last on (if they show up).
+  browseUid: readJson<string | null>(LAST_GUY_KEY, null),
+  sidebarTab: "chat",
   fileByGuy: {},
   routineRunByGuy: {},
   abilityByGuy: {},
@@ -112,8 +126,8 @@ export const useApp = create<AppState>((set, get) => ({
     }
   },
   selectGuy: (uid, sessionKey) => {
-    localStorage.setItem(LAST_GUY_KEY, JSON.stringify(uid));
-    set({ restoreUid: null });
+    activate(uid);
+    set({ browseUid: uid, sidebarTab: "chat" });
     showGuy(uid, sessionKey);
   },
   selectSession: (key) => {
@@ -127,17 +141,27 @@ export const useApp = create<AppState>((set, get) => ({
     set({ selectedSessionKey: key, view: "chat" });
   },
   setView: (view) => set({ view }),
-  selectRoutineRun: (key) => {
-    const uid = get().selectedUid;
-    if (uid) set({ routineRunByGuy: { ...get().routineRunByGuy, [uid]: key }, view: "routines" });
+  // Back in a guy you're on, the sidebar shows what's open; anyone else starts at their chats.
+  browse: (uid) => set({ browseUid: uid, sidebarTab: uid && uid === get().selectedUid ? get().view : "chat" }),
+  setSidebarTab: (sidebarTab) => set({ sidebarTab }),
+  selectRoutineRun: (key, uid = get().selectedUid ?? undefined) => {
+    if (!uid) return;
+    activate(uid);
+    set({ routineRunByGuy: { ...get().routineRunByGuy, [uid]: key }, view: "routines" });
   },
-  selectFile: (path) => {
-    const uid = get().selectedUid;
-    if (uid) set({ fileByGuy: { ...get().fileByGuy, [uid]: path }, view: "files" });
+  selectFile: (uid, path, open = true) => {
+    set({ fileByGuy: { ...get().fileByGuy, [uid]: path } });
+    if (open) {
+      activate(uid);
+      set({ view: "files" });
+    }
   },
-  selectAbility: (id) => {
-    const uid = get().selectedUid;
-    if (uid) set({ abilityByGuy: { ...get().abilityByGuy, [uid]: id }, view: "skills" });
+  selectAbility: (uid, id, open = true) => {
+    set({ abilityByGuy: { ...get().abilityByGuy, [uid]: id } });
+    if (open) {
+      activate(uid);
+      set({ view: "skills" });
+    }
   },
   setBrowserOpen: (uid, open) => {
     const browser = { ...get().browser, open: { ...get().browser.open, [uid]: open } };
@@ -167,9 +191,25 @@ export const useApp = create<AppState>((set, get) => ({
     if (nav.view === "add-gateway") return set({ addGatewayOpen: true });
     const agentId = nav.agentId ?? (nav.sessionKey ? agentIdFromKey(nav.sessionKey) : null);
     if (nav.gatewayId && agentId) get().selectGuy(guyUid(nav.gatewayId, agentId), nav.sessionKey ?? undefined);
-    if (nav.view === "routines" || nav.view === "files" || nav.view === "skills") set({ view: nav.view });
+    if (nav.view === "routines" || nav.view === "files" || nav.view === "skills") set({ view: nav.view, sidebarTab: nav.view });
   },
 }));
+
+/**
+ * Make a guy the one on screen (and the one to reopen at launch), keeping the
+ * main pane's view. Their last thread becomes the open chat.
+ */
+function activate(uid: string) {
+  localStorage.setItem(LAST_GUY_KEY, JSON.stringify(uid));
+  useApp.setState({ restoreUid: null });
+  if (useApp.getState().selectedUid === uid) return;
+  const { lastThreadByGuy, roster } = useApp.getState();
+  const last = lastThreadByGuy[uid];
+  const gatewayId = uid.slice(0, uid.indexOf("/"));
+  const agentId = uid.slice(uid.indexOf("/") + 1);
+  const key = last && threadKind(last) !== "routine" ? last : defaultThread(roster, { gatewayId, id: agentId });
+  useApp.setState({ selectedUid: uid, selectedSessionKey: key });
+}
 
 /** Show a guy (and their last thread) without making them the one to reopen. */
 function showGuy(uid: string, sessionKey?: string | null) {
@@ -199,6 +239,14 @@ export function mainSessionKey(agentId: string): string {
 export function agentIdFromKey(key: string): string | null {
   const parts = key.split(":");
   return parts[0] === "agent" && parts[1] ? parts[1] : null;
+}
+
+/** Guys with the newest message first, like a chat list; quiet ones keep display order. */
+export function recentGuys(roster: Roster, order: string[]): Guy[] {
+  return sortGuys(roster, order)
+    .map((guy) => ({ guy, at: activityFor(roster, guy).latest?.updatedAt ?? 0 }))
+    .sort((a, b) => b.at - a.at)
+    .map(({ guy }) => guy);
 }
 
 /** Guys in display order: user order, then gateway order, default guy first, then by name. */

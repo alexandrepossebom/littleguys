@@ -1,19 +1,19 @@
+import { Settings as SettingsIcon } from "lucide-react";
 import { useEffect } from "react";
 import { capsOf, liveGateways } from "../lib/guys";
 import { core, listen } from "../lib/ipc";
-import { useApp, useSelectedGuy } from "../stores/app";
+import { recentGuys, useApp, useSelectedGuy } from "../stores/app";
+import { IconButton } from "../ui/kit";
 import { AddGateway } from "./AddGateway";
 import { BrowserPanel } from "./BrowserPanel";
 import { ChatView } from "./ChatView";
 import { Doctor } from "./Doctor";
 import { FilesView } from "./Files";
-import { GatewayBanner } from "./GatewayBanner";
 import { GuyEditor } from "./GuyEditor";
 import { RoutinesPanel } from "./Routines";
 import { Settings } from "./Settings";
 import { Sidebar } from "./Sidebar";
 import { SkillsView } from "./Skills";
-import { StoriesBar } from "./StoriesBar";
 
 export function App() {
   const roster = useApp((s) => s.roster);
@@ -56,8 +56,9 @@ export function App() {
         document.dispatchEvent(new CustomEvent("lg:new-thread"));
       }
       if (e.metaKey && /^[1-9]$/.test(e.key)) {
-        const el = document.querySelectorAll<HTMLButtonElement>("[data-story]")[Number(e.key) - 1];
-        el?.click();
+        const { roster, order, selectGuy } = useApp.getState();
+        const guy = recentGuys(roster, order)[Number(e.key) - 1];
+        if (guy) selectGuy(guy.uid);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -66,8 +67,6 @@ export function App() {
 
   return (
     <div className="flex h-full flex-col">
-      <StoriesBar />
-      {connected && <GatewayBanner />}
       <div className="flex min-h-0 flex-1">
         {connected ? (
           <>
@@ -95,8 +94,15 @@ export function App() {
             </main>
           </>
         ) : (
-          <main className="flex min-w-0 flex-1 bg-[var(--color-pane-solid)]">
-            <Doctor />
+          <main className="flex min-w-0 flex-1 flex-col bg-[var(--color-pane-solid)]">
+            <div data-tauri-drag-region className="flex h-14 shrink-0 items-center justify-end px-3">
+              <IconButton label="Settings (⌘,)" onClick={() => useApp.getState().setSettingsOpen(true)}>
+                <SettingsIcon size={15} />
+              </IconButton>
+            </div>
+            <div className="flex min-h-0 flex-1">
+              <Doctor />
+            </div>
           </main>
         )}
       </div>
