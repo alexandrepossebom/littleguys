@@ -37,8 +37,8 @@ export interface ThreadState {
   hasMore: boolean;
   live: LiveRun | null;
   toolStatus: Record<string, ToolState>;
-  /** Optimistic user messages not yet confirmed by session.message. */
-  pending: Array<{ idempotencyKey: string; message: ChatMessage }>;
+  /** Optimistic user messages not yet confirmed by session.message (`runId` once chat.send answers). */
+  pending: Array<{ idempotencyKey: string; runId?: string; message: ChatMessage }>;
   sendError: string | null;
 }
 
@@ -51,6 +51,18 @@ interface ChatState {
   abort(id: string): Promise<void>;
   handleEvent(gateway: string, name: string, payload: Record<string, unknown>): void;
   resubscribe(gateway: string): void;
+}
+
+/**
+ * How many of the newest pending messages wait for the reply in progress to end
+ * (every runtime queues them until then). The one that started it doesn't wait.
+ */
+export function waitingCount(t: ThreadState | undefined): number {
+  if (!t?.live || !t.pending.length) return 0;
+  const first = t.pending[0];
+  // Before chat.send answers, the run's first event can beat it; then it's ours if sent before the run began.
+  const startedLive = first.runId ? first.runId === t.live.runId : (first.message.timestamp ?? 0) <= t.live.startedAt;
+  return t.pending.length - (startedLive ? 1 : 0);
 }
 
 const blank = (key: string): ThreadState => ({
@@ -138,8 +150,7 @@ export const useChat = create<ChatState>((set, get) => {
         patch(key, (t) => ({
           // "ok": a slash command answered without starting a turn.
           live: t.live ?? (res.status === "ok" ? null : { runId: res.runId, text: "", phase: "sending", startedAt: Date.now() }),
-          // chat.send uses its own idempotency key; re-key the optimistic entry by runId.
-          pending: t.pending.map((p) => (p.idempotencyKey === idempotencyKey ? { ...p, idempotencyKey: res.runId } : p)),
+          pending: t.pending.map((p) => (p.idempotencyKey === idempotencyKey ? { ...p, runId: res.runId } : p)),
         }));
       } catch (e) {
         patch(key, (t) => ({

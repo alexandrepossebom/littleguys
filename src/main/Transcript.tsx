@@ -77,6 +77,7 @@ export function Transcript({
   items,
   agent,
   live,
+  waiting = 0,
   toolStatus,
 }: {
   gatewayId: string;
@@ -84,6 +85,8 @@ export function Transcript({
   items: Item[];
   agent: AgentSummary;
   live: LiveRun | null;
+  /** The last `waiting` items are messages queued behind the reply in progress. */
+  waiting?: number;
   toolStatus: Record<string, ToolState>;
 }) {
   const sections: Section[] = [];
@@ -108,6 +111,10 @@ export function Transcript({
     prevKind = null;
     return sections[sections.length - 1];
   };
+
+  // Messages sent while the guy is still replying go below that reply.
+  const queued = live && waiting ? (items.slice(-waiting) as Array<Extract<Item, { kind: "user" }>>) : [];
+  if (queued.length) items = items.slice(0, -queued.length);
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -180,6 +187,9 @@ export function Transcript({
         )}
       </GuyLine>,
     );
+    queued.forEach((item, i) => {
+      sectionFor(Date.now()).nodes.push(<UserBubble key={item.id} item={item} first={i === 0} where={where} />);
+    });
   }
   return (
     <>

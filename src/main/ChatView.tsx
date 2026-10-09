@@ -6,7 +6,7 @@ import { core } from "../lib/ipc";
 import { presentTense, toolKind } from "../lib/toolPhrases";
 import type { Guy } from "../lib/types";
 import { useApp } from "../stores/app";
-import { threadId, useChat } from "../stores/chat";
+import { threadId, useChat, waitingCount } from "../stores/chat";
 import { Avatar, GuyMark } from "../ui/Avatar";
 import { Button, IconButton, Spinner } from "../ui/kit";
 import { Approvals } from "./Approvals";
@@ -164,7 +164,15 @@ export function ChatView({ guy, sessionKey }: { guy: Guy; sessionKey: string }) 
           </div>
         )}
         <div ref={contentRef} className="mx-auto max-w-[860px]">
-          <Transcript gatewayId={gw} sessionKey={sessionKey} items={items} agent={agent} live={live} toolStatus={thread?.toolStatus ?? {}} />
+          <Transcript
+            gatewayId={gw}
+            sessionKey={sessionKey}
+            items={items}
+            agent={agent}
+            live={live}
+            waiting={waitingCount(thread)}
+            toolStatus={thread?.toolStatus ?? {}}
+          />
           {thread?.sendError && (
             <p className="mt-3 text-center text-[12px] text-[var(--color-bad)]">{thread.sendError}</p>
           )}
