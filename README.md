@@ -51,7 +51,13 @@ littleguys can be connected to several OpenClaw gateways at once, and every gate
 
 ## Building from source
 
-You need Rust (stable), Node 22+ and pnpm. Xcode isn't required; the Command Line Tools are enough.
+The install script does it in one go. It installs whatever's missing (the Command Line Tools, Rust, and Node and pnpm if you don't have them), builds `main` in `~/.littleguys` and puts the app in `/Applications`. Run it again to update.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/herval/littleguys/main/install.sh | bash
+```
+
+By hand, you need Rust (stable), Node 22+ and pnpm. Xcode isn't required; the Command Line Tools are enough.
 
 ```bash
 make install       # dependencies, plus the Apple silicon and Intel Rust targets
@@ -59,6 +65,7 @@ make run           # app + hot-reloading UI
 make mock          # UI only, in a browser, with a mock gateway (fixtures)
                    #   ?phase=pairing|offline|no-config  previews the Doctor screens
 make build         # universal littleguys.app + .dmg in src-tauri/target/universal-apple-darwin/release/bundle/
+make install-app   # build the .app for this Mac only (faster, no LTO) and put it in /Applications
 make test          # Rust tests
 ```
 
